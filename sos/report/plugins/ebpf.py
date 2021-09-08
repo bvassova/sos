@@ -6,7 +6,7 @@
 #
 # See the LICENSE file in the source distribution for further information.
 
-from sos.report.plugins import Plugin, IndependentPlugin
+from sos.report.plugins import Plugin, IndependentPlugin, PluginOpt
 import json
 
 
@@ -15,6 +15,11 @@ class Ebpf(Plugin, IndependentPlugin):
     short_desc = 'eBPF tool'
     plugin_name = 'ebpf'
     profiles = ('system', 'kernel', 'network')
+
+    option_list = [
+        PluginOpt("namespaces", default=None, val_type=int,
+                  desc="Number of namespaces to collect, 0 for unlimited"),
+    ]
 
     def get_bpftool_prog_ids(self, prog_json):
         out = []
@@ -68,7 +73,8 @@ class Ebpf(Plugin, IndependentPlugin):
 
         # Capture list of bpf program attachments from namespaces
         cmd_prefix = "ip netns exec "
-        for namespace in self.get_network_namespaces():
+        nsps = self.get_option('namespaces')
+        for namespace in self.get_network_namespaces(ns_max=nsps):
             ns_cmd_prefix = cmd_prefix + namespace + " "
             self.add_cmd_output(ns_cmd_prefix + "bpftool net list")
 

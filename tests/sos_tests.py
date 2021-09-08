@@ -66,6 +66,8 @@ class BaseSoSTest(Test):
     _exception_expected = False
     sos_cmd = ''
     sos_timeout = 300
+    redhat_only = False
+    ubuntu_only = False
 
     @property
     def klass_name(self):
@@ -199,12 +201,31 @@ class BaseSoSTest(Test):
         }
         return sinfo
 
+    def check_distro_for_enablement(self):
+        """Check if the test case is meant only for a specific distro family,
+        and if it is and we are not running on that family, skip all the tests
+        for that test case.
+
+        This allows us to define distro-specific test classes much the same way
+        we can define distro-specific tests _within_ a test class using the
+        appropriate decorators. We can't use the decorators for the class however
+        due to how avocado catches instantiation exceptions, so instead we need
+        to raise the skip exception after instantiation is done.
+        """
+        if self.redhat_only:
+            if self.local_distro not in RH_DIST:
+                raise TestSkipError('Not running on a Red Hat distro')
+        elif self.ubuntu_only:
+            if self.local_distro not in UBUNTU_DIST:
+                raise TestSkipError("Not running on a Ubuntu or Debian distro")
+
     def setUp(self):
         """Setup the tmpdir and any needed mocking for the test, then execute
         the defined sos command. Ensure that we only run the sos command once
         for every test case, instead of once for every test_* method defined.
         """
         self.local_distro = distro.detect().name
+        self.check_distro_for_enablement()
         # check to prevent multiple setUp() runs
         if not os.path.isdir(self.tmpdir):
             # setup our class-shared tmpdir
@@ -287,6 +308,7 @@ class BaseSoSReportTest(BaseSoSTest):
     _manifest = None
     _exception_expected = False
     encrypt_pass = None
+    sos_component = 'report'
 
     @property
     def manifest(self):
@@ -316,6 +338,28 @@ class BaseSoSReportTest(BaseSoSTest):
                 self.fail("Decryption with well-known passphrase failed")
             raise
         return _archive
+
+    def grep_for_content(self, search):
+        """Call out to grep for finding a specific string 'search' in any place
+        in the archive
+        """
+        cmd = "grep -ril '%s' %s" % (search, self.archive_path)
+        try:
+            out = process.run(cmd)
+            rc = out.exit_status
+        except process.CmdError as err:
+            out = err.result
+            rc = err.result.exit_status
+
+        if rc == 1:
+            # grep will return an exit code of 1 if no matches are found,
+            # which is what we want
+            return False
+        else:
+            flist = []
+            for ln in out.stdout.decode('utf-8').splitlines():
+                flist.append(ln.split(self.tmpdir)[-1])
+            return flist
 
     def get_encrypted_path(self):
         """Since avocado re-instantiates a new object for every test_ method,
@@ -347,7 +391,7 @@ class BaseSoSReportTest(BaseSoSTest):
         return os.path.join(self.tmpdir, "sosreport-%s" % self.__class__.__name__)
         
     def _generate_sos_command(self):
-        return "%s report --batch --tmp-dir %s %s" % (SOS_BIN, self.tmpdir, self.sos_cmd)
+        return "%s %s --batch --tmp-dir %s %s" % (SOS_BIN, self.sos_component, self.tmpdir, self.sos_cmd)
 
     def _execute_sos_cmd(self):
         super(BaseSoSReportTest, self)._execute_sos_cmd()

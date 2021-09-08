@@ -11,8 +11,10 @@
 """ This exports methods available for use by plugins for sos """
 
 from sos.utilities import (sos_get_command_output, import_module, grep,
-                           fileobj, tail, is_executable, path_exists,
-                           path_isdir, path_isfile, path_islink, listdir)
+                           fileobj, tail, is_executable, TIMEOUT_DEFAULT,
+                           path_exists, path_isdir, path_isfile, path_islink,
+                           listdir)
+
 import os
 import glob
 import re
@@ -326,7 +328,11 @@ class SoSPredicate(object):
         """Used by `Plugin()` to obtain the error string based on if the reason
         was a failed check or a forbidden check
         """
-        msg = [self._report_failed(), self._report_forbidden()]
+        msg = [
+            self._report_failed(),
+            self._report_forbidden(),
+            '(dry run)' if self.dry_run else ''
+        ]
         return " ".join(msg).lstrip()
 
     def __nonzero__(self):
@@ -400,7 +406,86 @@ class SoSCommand(object):
                          sorted(self.__dict__.items()))
 
 
-class Plugin(object):
+class PluginOpt():
+    """This is used to define options available to plugins. Plugins will need
+    to define options alongside their distro-specific classes in order to add
+    support for user-controlled changes in Plugin behavior.
+
+    :param name:        The name of the plugin option
+    :type name:         ``str``
+
+    :param default:     The default value of the option
+    :type default:      Any
+
+    :param desc:        A short description of the effect of the option
+    :type desc:         ``str``
+
+    :param long_desc:   A detailed description of the option. Will be used by
+                        `sos info`
+    :type long_desc:    ``str``
+
+    :param val_type:    The type of object the option accepts for values. If
+                        not provided, auto-detect from the type of ``default``
+    :type val_type:     A single type or a ``list`` of types
+    """
+
+    name = ''
+    default = None
+    enabled = False
+    desc = ''
+    long_desc = ''
+    value = None
+    val_type = [None]
+    plugin = ''
+
+    def __init__(self, name='undefined', default=None, desc='', long_desc='',
+                 val_type=None):
+        self.name = name
+        self.default = default
+        self.desc = desc
+        self.long_desc = long_desc
+        self.value = self.default
+        if val_type is not None:
+            if not isinstance(val_type, list):
+                val_type = [val_type]
+        else:
+            val_type = [default.__class__]
+        self.val_type = val_type
+
+    def __str__(self):
+        items = [
+            'name=%s' % self.name,
+            'desc=\'%s\'' % self.desc,
+            'value=%s' % self.value,
+            'default=%s' % self.default
+        ]
+        return '(' + ', '.join(items) + ')'
+
+    def __repr__(self):
+        return self.__str__()
+
+    def set_value(self, val):
+        if not any([type(val) == _t for _t in self.val_type]):
+            valid = []
+            for t in self.val_type:
+                if t is None:
+                    continue
+                if t.__name__ == 'bool':
+                    valid.append("boolean true/false (on/off, etc)")
+                elif t.__name__ == 'str':
+                    valid.append("string (no spaces)")
+                elif t.__name__ == 'int':
+                    valid.append("integer values")
+            raise Exception(
+                "Plugin option '%s.%s' takes %s, not %s" % (
+                    self.plugin, self.name, ', '.join(valid),
+                    type(val).__name__
+                )
+            )
+        self.value = val
+
+
+class Plugin():
     """This is the base class for sosreport plugins. Plugins should subclass
     this and set the class variables where applicable.
 
@@ -458,8 +543,8 @@ class Plugin(object):
     archive = None
     profiles = ()
     sysroot = '/'
-    plugin_timeout = 300
-    cmd_timeout = 300
+    plugin_timeout = TIMEOUT_DEFAULT
+    cmd_timeout = TIMEOUT_DEFAULT
     _timeout_hit = False
     cmdtags = {}
     filetags = {}
@@ -468,15 +553,14 @@ class Plugin(object):
     # Default predicates
     predicate = None
     cmd_predicate = None
-    _default_plug_opts = [
-        ('timeout', 'Timeout in seconds for plugin. The default value (-1) ' +
-            'defers to the general plugin timeout, 300 seconds', 'fast', -1),
-        ('cmd-timeout', 'Timeout in seconds for a command execution. The ' +
-            'default value (-1) defers to the general cmd timeout, 300 ' +
-            'seconds', 'fast', -1),
-        ('postproc', 'Enable post-processing collected plugin data', 'fast',
-         True)
-    ]
+    _default_plug_opts = {
+        'timeout': PluginOpt('timeout', default=-1, val_type=int,
+                             desc='Timeout in seconds for plugin to finish'),
+        'cmd-timeout': PluginOpt('cmd-timeout', default=-1, val_type=int,
+                                 desc='Timeout in seconds for cmds to finish'),
+        'postproc': PluginOpt('postproc', default=True, val_type=bool,
+                              desc='Enable post-processing of collected data')
+    }
 
     def __init__(self, commons):
 
@@ -485,13 +569,12 @@ class Plugin(object):
         self._env_vars = set()
         self.alerts = []
         self.custom_text = ""
-        self.opt_names = []
-        self.opt_parms = []
         self.commons = commons
         self.forbidden_paths = []
         self.copy_paths = set()
         self.copy_strings = []
         self.collect_cmds = []
+        self.options = {}
         self.sysroot = commons['sysroot']
         self.policy = commons['policy']
         self.devices = commons['devices']
@@ -503,13 +586,12 @@ class Plugin(object):
             else logging.getLogger('sos')
 
         # add the default plugin opts
-        self.option_list.extend(self._default_plug_opts)
-
-        # get the option list into a dictionary
+        self.options.update(self._default_plug_opts)
+        for popt in self.options:
+            self.options[popt].plugin = self.name()
         for opt in self.option_list:
-            self.opt_names.append(opt[0])
-            self.opt_parms.append({'desc': opt[1], 'speed': opt[2],
-                                   'enabled': opt[3]})
+            opt.plugin = self.name()
+            self.options[opt.name] = opt
 
         # Initialise the default --dry-run predicate
         self.set_predicate(SoSPredicate(self))
@@ -1208,10 +1290,6 @@ class Plugin(object):
             for path in glob.glob(forbid, recursive=recursive):
                 self.forbidden_paths.append(path)
 
-    def get_all_options(self):
-        """return a list of all options selected"""
-        return (self.opt_names, self.opt_parms)
-
     def set_option(self, optionname, value):
         """Set the named option to value. Ensure the original type of the
         option value is preserved
@@ -1224,18 +1302,13 @@ class Plugin(object):
         :returns: ``True`` if the option is successfully set, else ``False``
         :rtype: ``bool``
         """
-        for name, parms in zip(self.opt_names, self.opt_parms):
-            if name == optionname:
-                # FIXME: ensure that the resulting type of the set option
-                # matches that of the default value. This prevents a string
-                # option from being coerced to int simply because it holds
-                # a numeric value (e.g. a password).
-                # See PR #1526 and Issue #1597
-                defaulttype = type(parms['enabled'])
-                if defaulttype != type(value) and defaulttype != type(None):
-                    value = (defaulttype)(value)
-                parms['enabled'] = value
+        if optionname in self.options:
+            try:
+                self.options[optionname].set_value(value)
                 return True
+            except Exception as err:
+                self._log_error(err)
+                raise
         return False
 
     def get_option(self, optionname, default=0):
@@ -1263,24 +1336,12 @@ class Plugin(object):
         if optionname in global_options:
             return getattr(self.commons['cmdlineopts'], optionname)
 
-        for name, parms in zip(self.opt_names, self.opt_parms):
-            if name == optionname:
-                val = parms['enabled']
-                if val is not None:
-                    return val
-
-        return default
-
-    def get_option_as_list(self, optionname, delimiter=",", default=None):
-        """Will try to return the option as a list separated by the
-        delimiter.
-        """
-        option = self.get_option(optionname)
-        try:
-            opt_list = [opt.strip() for opt in option.split(delimiter)]
-            return list(filter(None, opt_list))
-        except Exception:
+        if optionname in self.options:
+            opt = self.options[optionname]
+            if not default or opt.value is not None:
+                return opt.value
             return default
+        return default
 
     def _add_copy_paths(self, copy_paths):
         self.copy_paths.update(copy_paths)
@@ -1633,6 +1694,8 @@ class Plugin(object):
         pred = kwargs.pop('pred') if 'pred' in kwargs else SoSPredicate(self)
         if 'priority' not in kwargs:
             kwargs['priority'] = 10
+        if 'changes' not in kwargs:
+            kwargs['changes'] = False
         soscmd = SoSCommand(**kwargs)
         self._log_debug("packed command: " + soscmd.__str__())
         for _skip_cmd in self.skip_commands:
@@ -2843,11 +2906,13 @@ class Plugin(object):
                 continue
         return pids
 
-    def get_network_namespaces(self, ns_pattern=None, ns_max=0):
+    def get_network_namespaces(self, ns_pattern=None, ns_max=None):
+        if ns_max is None and self.commons['cmdlineopts'].namespaces:
+            ns_max = self.commons['cmdlineopts'].namespaces
         return self.filter_namespaces(self.commons['namespaces']['network'],
                                       ns_pattern, ns_max)
 
-    def filter_namespaces(self, ns_list, ns_pattern=None, ns_max=0):
+    def filter_namespaces(self, ns_list, ns_pattern=None, ns_max=None):
         """Filter a list of namespaces by regex pattern or max number of
         namespaces (options originally present in the networking plugin.)
         """
@@ -2859,15 +2924,14 @@ class Plugin(object):
                 '(?:%s$)' % '$|'.join(ns_pattern.split()).replace('*', '.*')
                 )
         for ns in ns_list:
-            # if ns_pattern defined, append only namespaces
-            # matching with pattern
+            # if ns_pattern defined, skip namespaces not matching the pattern
             if ns_pattern:
-                if bool(re.match(pattern, ns)):
-                    out_ns.append(ns)
+                if not bool(re.match(pattern, ns)):
+                    continue
 
-            # if ns_max is defined and ns_pattern is not defined
-            # remove from out_ns namespaces with higher index than defined
-            elif ns_max != 0:
+            # if ns_max is defined at all, limit returned list to that number
+            # this allows the use of both '0' and `None` to mean unlimited
+            elif ns_max:
                 out_ns.append(ns)
                 if len(out_ns) == ns_max:
                     self._log_warn("Limiting namespace iteration "

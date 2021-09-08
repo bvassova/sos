@@ -20,8 +20,8 @@ env:
     # These are generated images pushed to GCP from Red Hat
     FEDORA_IMAGE_NAME: "f${FEDORA_VER}-server-sos-testing"
     FEDORA_PRIOR_IMAGE_NAME: "f${FEDORA_PRIOR_VER}-server-sos-testing"
-    FOREMAN_CENTOS_IMAGE_NAME: "foreman-24-centos-8-sos-testing"
-    FOREMAN_DEBIAN_IMAGE_NAME: "foreman-24-debian-sos-testing"
+    FOREMAN_CENTOS_IMAGE_NAME: "foreman-25-centos-8-sos-testing"
+    FOREMAN_DEBIAN_IMAGE_NAME: "foreman-25-debian-10-sos-testing"
 
     # Images exist on GCP already
     CENTOS_IMAGE_NAME: "centos-stream-8-v20210609"
@@ -31,7 +31,7 @@ env:
 # Default task timeout
 timeout_in: 30m
 
-# enable auto cancelling concurrent builds on master when multiple PRs are
+# enable auto cancelling concurrent builds on main when multiple PRs are
 # merged at once
 auto_cancellation: true
 
@@ -70,6 +70,20 @@ py_break_task:
     setup_script: pip install -r requirements.txt
     main_script: ./bin/sos report --batch
 
+# Make sure a user can manually build an rpm from the checkout
+rpm_build_task:
+    alias: "rpm_build"
+    name: "RPM Build From Checkout"
+    container:
+        image: "fedora"
+    setup_script: dnf -y install rpm-build rpmdevtools gettext python3-devel
+    main_script: |
+        rpmdev-setuptree
+        python3 setup.py sdist
+        cp dist/sos*.tar.gz ~/rpmbuild/SOURCES
+        rpmbuild -bs sos.spec
+        rpmbuild -bb sos.spec
+
 # Run the stage one (no mocking) tests across all distros on GCP
 report_stageone_task:
     alias: "stageone_report"
@@ -78,8 +92,6 @@ report_stageone_task:
         image_project: "${PROJECT}"
         image_name: "${VM_IMAGE_NAME}"
         type: e2-medium
-        # minimum disk size is 20
-        disk: 20
     matrix:
         - env:
             PROJECT: ${CENTOS_PROJECT}
@@ -104,14 +116,14 @@ report_stageone_task:
     remove_sos_script: &remove_sos |
         if [ $(command -v apt) ]; then
             apt -y purge sosreport
-            apt update
+            apt update --allow-releaseinfo-change
             apt -y install python3-pip
         fi
         if [ $(command -v dnf) ]; then
             dnf -y remove sos
         fi
     setup_script: &setup 'pip3 install avocado-framework'
-    main_script: PYTHONPATH=tests/ avocado run -t stageone tests/{cleaner,collect,report,vendor}_tests
+    main_script: PYTHONPATH=tests/ avocado run --test-runner=runner -t stageone tests/{cleaner,collect,report,vendor}_tests
 
 # IFF the stage one tests all pass, then run stage two for latest distros
 report_stagetwo_task:
@@ -141,7 +153,7 @@ report_stagetwo_task:
             dnf -y install python3-pexpect
         fi
     setup_script: *setup
-    main_script: PYTHONPATH=tests/ avocado run -t stagetwo tests/{cleaner,collect,report,vendor}_tests
+    main_script: PYTHONPATH=tests/ avocado run --test-runner=runner -t stagetwo tests/{cleaner,collect,report,vendor}_tests
 
 report_foreman_task:
     skip: "!changesInclude('.cirrus.yml', '**/{__init__,apache,foreman,foreman_tests,candlepin,pulp,pulpcore}.py')"
@@ -155,11 +167,11 @@ report_foreman_task:
         - env:
             PROJECT: ${SOS_PROJECT}
             VM_IMAGE_NAME: ${FOREMAN_CENTOS_IMAGE_NAME}
-            FOREMAN_VER: "2.4 - CentOS Stream 8"
+            FOREMAN_VER: "2.5 - CentOS Stream 8"
         - env:
             PROJECT: ${SOS_PROJECT}
             VM_IMAGE_NAME: ${FOREMAN_DEBIAN_IMAGE_NAME}
-            FOREMAN_VER: "2.4 - Debian 10"
+            FOREMAN_VER: "2.5 - Debian 10"
     remove_sos_script: *remove_sos
     setup_script: *setup
-    main_script: PYTHONPATH=tests/ avocado run -t foreman tests/product_tests/foreman/
+    main_script: PYTHONPATH=tests/ avocado run --test-runner=runner -t foreman tests/product_tests/foreman/

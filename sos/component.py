@@ -83,7 +83,7 @@ class SoSComponent():
 
         # update args from component's arg_defaults defintion
         self._arg_defaults.update(self.arg_defaults)
-        self.opts = self.load_options()
+        self.opts = self.load_options()  # lgtm [py/init-calls-subclass]
 
         if self.configure_logging:
             tmpdir = self.get_tmpdir_default()
@@ -210,6 +210,14 @@ class SoSComponent():
                 option.default = None
 
         opts.update_from_conf(self.args.config_file, self.args.component)
+
+        # directly check the cmdline options here as they have yet to be loaded
+        # as SoSOptions, and if we do this check after they are loaded we would
+        # need to do a second update from cmdline options for overriding config
+        # file values
+        if '--clean' in self.cmdline or '--mask' in self.cmdline:
+            opts.update_from_conf(self.args.config_file, 'clean')
+
         if os.getuid() != 0:
             userconf = os.path.join(Path.home(), '.config/sos/sos.conf')
             if os.path.exists(userconf):

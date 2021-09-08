@@ -7,7 +7,7 @@
 # See the LICENSE file in the source distribution for further information.
 
 from sos.report.plugins import (Plugin, RedHatPlugin, UbuntuPlugin,
-                                DebianPlugin, SoSPredicate)
+                                DebianPlugin, SoSPredicate, PluginOpt)
 
 
 class Networking(Plugin):
@@ -17,35 +17,35 @@ class Networking(Plugin):
     plugin_name = "networking"
     profiles = ('network', 'hardware', 'system')
     trace_host = "www.example.com"
+
     option_list = [
-        ("traceroute", "collect a traceroute to %s" % trace_host, "slow",
-         False),
-        ("namespace_pattern", "Specific namespaces pattern to be " +
-         "collected, namespaces pattern should be separated by whitespace " +
-         "as for example \"eth* ens2\"", "fast", ""),
-        ("namespaces", "Number of namespaces to collect, 0 for unlimited. " +
-         "Incompatible with the namespace_pattern plugin option", "slow", 0),
-        ("ethtool_namespaces", "Define if ethtool commands should be " +
-         "collected for namespaces", "slow", True),
-        ("eepromdump", "collect 'ethtool -e' for all devices", "slow", False)
+        PluginOpt("traceroute", default=False,
+                  desc="collect a traceroute to %s" % trace_host),
+        PluginOpt("namespace_pattern", default="", val_type=str,
+                  desc=("Specific namespace names or patterns to collect, "
+                        "whitespace delimited.")),
+        PluginOpt("namespaces", default=None, val_type=int,
+                  desc="Number of namespaces to collect, 0 for unlimited"),
+        PluginOpt("ethtool_namespaces", default=True,
+                  desc=("Toggle if ethtool commands should be run for each "
+                        "namespace")),
+        PluginOpt("eepromdump", default=False,
+                  desc="Toggle collection of 'ethtool -e' for NICs")
     ]
 
     # switch to enable netstat "wide" (non-truncated) output mode
     ns_wide = "-W"
 
+    # list of ethtool short options, used in add_copy_spec and add_cmd_tags
+    # do NOT add there "e" (see eepromdump plugopt)
+    ethtool_shortopts = "acdgiklmPST"
+
     def setup(self):
         super(Networking, self).setup()
-
-        self.add_cmd_tags({
-            'ethtool -a .*': 'ethool_a',
-            'ethtool -i .*': 'ethtool_i',
-            'ethtool -k .*': 'ethtool_k',
-            'ethtool -S .*': 'ethtool_S',
-            'ethtool -g .*': 'ethtool_g',
-            'ethtool -T .*': 'ethtool_T',
-            'ethtool -c .*': 'ethtool_c',
-            'ethtool -d .*': 'ethtool_d'
-        })
+        for opt in self.ethtool_shortopts:
+            self.add_cmd_tags({
+                'ethtool -%s .*' % opt: 'ethool_%s' % opt
+            })
 
         self.add_file_tags({
             '/proc/net/bonding/bond.*': 'bond',
@@ -143,17 +143,11 @@ class Networking(Plugin):
             if eth == "bonding_masters":
                 continue
             self.add_cmd_output([
+                "ethtool -%s %s" % (opt, eth) for opt in self.ethtool_shortopts
+            ])
+
+            self.add_cmd_output([
                 "ethtool " + eth,
-                "ethtool -d " + eth,
-                "ethtool -i " + eth,
-                "ethtool -k " + eth,
-                "ethtool -S " + eth,
-                "ethtool -T " + eth,
-                "ethtool -a " + eth,
-                "ethtool -c " + eth,
-                "ethtool -g " + eth,
-                "ethtool -P " + eth,
-                "ethtool -l " + eth,
                 "ethtool --phy-statistics " + eth,
                 "ethtool --show-priv-flags " + eth,
                 "ethtool --show-eee " + eth,

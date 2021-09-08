@@ -76,7 +76,7 @@ class SoSCleaner(SoSComponent):
             # when obfuscating a SoSCollector run during archive extraction
             os.makedirs(os.path.join(self.tmpdir, 'cleaner'), exist_ok=True)
 
-        self.validate_map_file()
+        self.cleaner_mapping = self.load_map_file()
         os.umask(0o77)
         self.in_place = in_place
         self.hash_name = self.policy.get_preferred_hash_name()
@@ -84,12 +84,12 @@ class SoSCleaner(SoSComponent):
         self.cleaner_md = self.manifest.components.add_section('cleaner')
 
         self.parsers = [
-            SoSHostnameParser(self.opts.map_file, self.opts.domains),
-            SoSIPParser(self.opts.map_file),
-            SoSMacParser(self.opts.map_file),
-            SoSKeywordParser(self.opts.map_file, self.opts.keywords,
+            SoSHostnameParser(self.cleaner_mapping, self.opts.domains),
+            SoSIPParser(self.cleaner_mapping),
+            SoSMacParser(self.cleaner_mapping),
+            SoSKeywordParser(self.cleaner_mapping, self.opts.keywords,
                              self.opts.keyword_file),
-            SoSUsernameParser(self.opts.map_file, self.opts.usernames)
+            SoSUsernameParser(self.cleaner_mapping, self.opts.usernames)
         ]
 
         self.log_info("Cleaner initialized. From cmdline: %s"
@@ -114,12 +114,13 @@ class SoSCleaner(SoSComponent):
             _fmt = _fmt + fill(line, width, replace_whitespace=False) + '\n'
         return _fmt
 
-    def validate_map_file(self):
+    def load_map_file(self):
         """Verifies that the map file exists and has usable content.
 
         If the provided map file does not exist, or it is empty, we will print
         a warning and continue on with cleaning building a fresh map
         """
+        _conf = {}
         default_map = '/etc/sos/cleaner/default_mapping'
         if os.path.isdir(self.opts.map_file):
             raise Exception("Requested map file %s is a directory"
@@ -132,13 +133,14 @@ class SoSCleaner(SoSComponent):
         else:
             with open(self.opts.map_file, 'r') as mf:
                 try:
-                    json.load(mf)
+                    _conf = json.load(mf)
                 except json.JSONDecodeError:
                     self.log_error("ERROR: Unable to parse map file, json is "
                                    "malformed. Will not load any mappings.")
                 except Exception as err:
                     self.log_error("ERROR: Could not load '%s': %s"
                                    % (self.opts.map_file, err))
+        return _conf
 
     def print_disclaimer(self):
         """When we are directly running `sos clean`, rather than hooking into
@@ -516,23 +518,27 @@ third party.
             for _parser in self.parsers:
                 if not _parser.prep_map_file:
                     continue
-                _arc_path = os.path.join(_arc_name, _parser.prep_map_file)
-                try:
-                    if is_dir:
-                        _pfile = open(_arc_path, 'r')
-                        content = _pfile.read()
-                    else:
-                        _pfile = archive.extractfile(_arc_path)
-                        content = _pfile.read().decode('utf-8')
-                    _pfile.close()
-                    if isinstance(_parser, SoSUsernameParser):
-                        _parser.load_usernames_into_map(content)
-                    for line in content.splitlines():
-                        if isinstance(_parser, SoSHostnameParser):
-                            _parser.load_hostname_into_map(line)
-                        self.obfuscate_line(line)
-                except Exception as err:
-                    self.log_debug("Could not prep %s: %s" % (_arc_path, err))
+                if isinstance(_parser.prep_map_file, str):
+                    _parser.prep_map_file = [_parser.prep_map_file]
+                for parse_file in _parser.prep_map_file:
+                    _arc_path = os.path.join(_arc_name, parse_file)
+                    try:
+                        if is_dir:
+                            _pfile = open(_arc_path, 'r')
+                            content = _pfile.read()
+                        else:
+                            _pfile = archive.extractfile(_arc_path)
+                            content = _pfile.read().decode('utf-8')
+                        _pfile.close()
+                        if isinstance(_parser, SoSUsernameParser):
+                            _parser.load_usernames_into_map(content)
+                        for line in content.splitlines():
+                            if isinstance(_parser, SoSHostnameParser):
+                                _parser.load_hostname_into_map(line)
+                            self.obfuscate_line(line)
+                    except Exception as err:
+                        self.log_debug("Could not prep %s: %s"
+                                       % (_arc_path, err))
 
     def obfuscate_report(self, report):
         """Individually handle each archive or directory we've discovered by
