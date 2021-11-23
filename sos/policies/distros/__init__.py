@@ -29,6 +29,10 @@ try:
 except ImportError:
     REQUESTS_LOADED = False
 
+# Container environment variables for detecting if we're in a container
+ENV_CONTAINER = 'container'
+ENV_HOST_SYSROOT = 'HOST'
+
 
 class LinuxPolicy(Policy):
     """This policy is meant to be an abc class that provides common
@@ -69,10 +73,17 @@ class LinuxPolicy(Policy):
                                           probe_runtime=probe_runtime)
         self.init_kernel_modules()
 
+        # need to set _host_sysroot before PackageManager()
+        if sysroot:
+            self._container_init()
+            self._host_sysroot = sysroot
+        else:
+            sysroot = self._container_init()
+
         if init is not None:
             self.init_system = init
         elif os.path.isdir("/run/systemd/system/"):
-            self.init_system = SystemdInit()
+            self.init_system = SystemdInit(chroot=sysroot)
         else:
             self.init_system = InitSystem()
 
@@ -129,6 +140,21 @@ class LinuxPolicy(Policy):
 
     def sanitize_filename(self, name):
         return re.sub(r"[^-a-z,A-Z.0-9]", "", name)
+
+    def _container_init(self):
+        """Check if sos is running in a container and perform container
+        specific initialisation based on ENV_HOST_SYSROOT.
+        """
+        if ENV_CONTAINER in os.environ:
+            if os.environ[ENV_CONTAINER] in ['docker', 'oci', 'podman']:
+                self._in_container = True
+        if ENV_HOST_SYSROOT in os.environ:
+            self._host_sysroot = os.environ[ENV_HOST_SYSROOT]
+        use_sysroot = self._in_container and self._host_sysroot is not None
+        if use_sysroot:
+            host_tmp_dir = os.path.abspath(self._host_sysroot + self._tmp_dir)
+            self._tmp_dir = host_tmp_dir
+        return self._host_sysroot if use_sysroot else None
 
     def init_kernel_modules(self):
         """Obtain a list of loaded kernel modules to reference later for plugin
@@ -193,11 +219,12 @@ class LinuxPolicy(Policy):
                 cmdline_opts.quiet:
             try:
                 if caseid:
-                    self.case_id = caseid
+                    self.commons['cmdlineopts'].case_id = caseid
                 else:
-                    self.case_id = input(_("Optionally, please enter the case "
-                                           "id that you are generating this "
-                                           "report for [%s]: ") % caseid)
+                    self.commons['cmdlineopts'].case_id = input(
+                        _("Optionally, please enter the case id that you are "
+                          "generating this report for [%s]: ") % caseid
+                    )
                 # Policies will need to handle the prompts for user information
                 if cmdline_opts.upload and self.get_upload_url():
                     self.prompt_for_upload_user()

@@ -12,6 +12,7 @@ import os
 
 from pipes import quote
 from sos.collector.clusters import Cluster
+from sos.utilities import is_executable
 
 
 class ocp(Cluster):
@@ -22,10 +23,12 @@ class ocp(Cluster):
 
     api_collect_enabled = False
     token = None
+    project = 'sos-collect-tmp'
+    oc_cluster_admin = None
 
     option_list = [
         ('label', '', 'Colon delimited list of labels to select nodes with'),
-        ('role', '', 'Colon delimited list of roles to select nodes with'),
+        ('role', 'master', 'Colon delimited list of roles to filter on'),
         ('kubeconfig', '', 'Path to the kubeconfig file'),
         ('token', '', 'Service account token to use for oc authorization')
     ]
@@ -55,6 +58,42 @@ class ocp(Cluster):
         _who = self.fmt_oc_cmd('whoami')
         return self.exec_primary_cmd(_who)['status'] == 0
 
+    def setup(self):
+        """Create the project that we will be executing in for any nodes'
+        collection via a container image
+        """
+        if not self.set_transport_type() == 'oc':
+            return
+
+        out = self.exec_primary_cmd(self.fmt_oc_cmd("auth can-i '*' '*'"))
+        self.oc_cluster_admin = out['status'] == 0
+        if not self.oc_cluster_admin:
+            self.log_debug("Check for cluster-admin privileges returned false,"
+                           " cannot create project in OCP cluster")
+            raise Exception("Insufficient permissions to create temporary "
+                            "collection project.\nAborting...")
+
+        self.log_info("Creating new temporary project '%s'" % self.project)
+        ret = self.exec_primary_cmd("oc new-project %s" % self.project)
+        if ret['status'] == 0:
+            return True
+
+        self.log_debug("Failed to create project: %s" % ret['output'])
+        raise Exception("Failed to create temporary project for collection. "
+                        "\nAborting...")
+
+    def cleanup(self):
+        """Remove the project we created to execute within
+        """
+        if self.project:
+            ret = self.exec_primary_cmd("oc delete project %s" % self.project)
+            if not ret['status'] == 0:
+                self.log_error("Error deleting temporary project: %s"
+                               % ret['output'])
+            # don't leave the config on a non-existing project
+            self.exec_primary_cmd("oc project default")
+        return True
+
     def _build_dict(self, nodelist):
         """From the output of get_nodes(), construct an easier-to-reference
         dict of nodes that will be used in determining labels, primary status,
@@ -83,6 +122,19 @@ class ocp(Cluster):
                     nodes[_node[0]][column] = _node[idx[column]]
         return nodes
 
+    def set_transport_type(self):
+        if is_executable('oc') or self.opts.transport == 'oc':
+            return 'oc'
+        self.log_info("Local installation of 'oc' not found or is not "
+                      "correctly configured. Will use ControlPersist.")
+        self.ui_log.warn(
+            "Preferred transport 'oc' not available, will fallback to SSH."
+        )
+        if not self.opts.batch:
+            input("Press ENTER to continue connecting with SSH, or Ctrl+C to"
+                  "abort.")
+        return 'control_persist'
+
     def get_nodes(self):
         nodes = []
         self.node_dict = {}
@@ -92,8 +144,12 @@ class ocp(Cluster):
             cmd += " -l %s" % quote(labels)
         res = self.exec_primary_cmd(self.fmt_oc_cmd(cmd))
         if res['status'] == 0:
+            if self.get_option('role') == 'master':
+                self.log_warn("NOTE: By default, only master nodes are listed."
+                              "\nTo collect from all/more nodes, override the "
+                              "role option with '-c ocp.role=role1:role2'")
             roles = [r for r in self.get_option('role').split(':')]
-            self.node_dict = self._build_dict(res['stdout'].splitlines())
+            self.node_dict = self._build_dict(res['output'].splitlines())
             for node in self.node_dict:
                 if roles:
                     for role in roles:
@@ -103,7 +159,7 @@ class ocp(Cluster):
                     nodes.append(node)
         else:
             msg = "'oc' command failed"
-            if 'Missing or incomplete' in res['stdout']:
+            if 'Missing or incomplete' in res['output']:
                 msg = ("'oc' failed due to missing kubeconfig on primary node."
                        " Specify one via '-c ocp.kubeconfig=<path>'")
             raise Exception(msg)
@@ -127,7 +183,7 @@ class ocp(Cluster):
         if self.api_collect_enabled:
             # a primary has already been enabled for API collection, disable
             # it among others
-            node.plugin_options.append('openshift.no-oc=on')
+            node.plugopts.append('openshift.no-oc=on')
         else:
             _oc_cmd = 'oc'
             if node.host.containerized:
@@ -167,4 +223,6 @@ class ocp(Cluster):
 
     def set_node_options(self, node):
         # don't attempt OC API collections on non-primary nodes
-        node.plugin_options.append('openshift.no-oc=on')
+        node.plugopts.append('openshift.no-oc=on')
+
+# vim: set et ts=4 sw=4 :

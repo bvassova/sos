@@ -149,6 +149,16 @@ class Cluster():
         """
         pass
 
+    def set_transport_type(self):
+        """The default connection type used by sos collect is to leverage the
+        local system's SSH installation using ControlPersist, however certain
+        cluster types may want to use something else.
+
+        Override this in a specific cluster profile to set the ``transport``
+        option according to what type of transport should be used.
+        """
+        return 'control_persist'
+
     def set_primary_options(self, node):
         """If there is a need to set specific options in the sos command being
         run on the cluster's primary nodes, override this method in the cluster
@@ -182,9 +192,10 @@ class Cluster():
         :returns: The output and status of `cmd`
         :rtype: ``dict``
         """
-        res = self.primary.run_command(cmd, get_pty=True, need_root=need_root)
-        if res['stdout']:
-            res['stdout'] = res['stdout'].replace('Password:', '')
+        pty = self.primary.local is False
+        res = self.primary.run_command(cmd, get_pty=pty, need_root=need_root)
+        if res['output']:
+            res['output'] = res['output'].replace('Password:', '')
         return res
 
     def setup(self):
@@ -212,6 +223,16 @@ class Cluster():
             if self.primary.is_installed(pkg):
                 return True
         return False
+
+    def cleanup(self):
+        """
+        This may be overridden by clusters
+
+        Perform any necessary cleanup steps required by the cluster profile.
+        This helps ensure that sos does make lasting changes to the environment
+        in which we are running
+        """
+        pass
 
     def get_nodes(self):
         """

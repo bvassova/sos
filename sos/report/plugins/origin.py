@@ -8,7 +8,7 @@
 #
 # See the LICENSE file in the source distribution for further information.
 
-from sos.report.plugins import Plugin, RedHatPlugin, PluginOpt
+from sos.report.plugins import Plugin, RedHatPlugin
 import os.path
 
 # This plugin collects static configuration and runtime information
@@ -40,15 +40,6 @@ class OpenShiftOrigin(Plugin):
     files = None  # file lists assigned after path setup below
     profiles = ('openshift',)
 
-    option_list = [
-        PluginOpt('diag', default=True,
-                  desc='Collect oc adm diagnostics output'),
-        PluginOpt('diag-prevent', default=True,
-                  desc='Use --prevent-modification with oc adm diagnostics'),
-        PluginOpt('all-namespaces', default=False,
-                  desc='collect dc output for all namespaces')
-    ]
-
     master_base_dir = "/etc/origin/master"
     node_base_dir = "/etc/origin/node"
     master_cfg = os.path.join(master_base_dir, "master-config.yaml")
@@ -78,20 +69,21 @@ class OpenShiftOrigin(Plugin):
 
     def is_static_etcd(self):
         """Determine if we are on a node running etcd"""
-        return self.path_exists(os.path.join(self.static_pod_dir, "etcd.yaml"))
+        return self.path_exists(self.path_join(self.static_pod_dir,
+                                               "etcd.yaml"))
 
     def is_static_pod_compatible(self):
         """Determine if a node is running static pods"""
         return self.path_exists(self.static_pod_dir)
 
     def setup(self):
-        bstrap_node_cfg = os.path.join(self.node_base_dir,
-                                       "bootstrap-" + self.node_cfg_file)
-        bstrap_kubeconfig = os.path.join(self.node_base_dir,
-                                         "bootstrap.kubeconfig")
-        node_certs = os.path.join(self.node_base_dir, "certs", "*")
-        node_client_ca = os.path.join(self.node_base_dir, "client-ca.crt")
-        admin_cfg = os.path.join(self.master_base_dir, "admin.kubeconfig")
+        bstrap_node_cfg = self.path_join(self.node_base_dir,
+                                         "bootstrap-" + self.node_cfg_file)
+        bstrap_kubeconfig = self.path_join(self.node_base_dir,
+                                           "bootstrap.kubeconfig")
+        node_certs = self.path_join(self.node_base_dir, "certs", "*")
+        node_client_ca = self.path_join(self.node_base_dir, "client-ca.crt")
+        admin_cfg = self.path_join(self.master_base_dir, "admin.kubeconfig")
         oc_cmd_admin = "%s --config=%s" % ("oc", admin_cfg)
         static_pod_logs_cmd = "master-logs"
 
@@ -101,15 +93,19 @@ class OpenShiftOrigin(Plugin):
             self.add_copy_spec([
                 self.master_cfg,
                 self.master_env,
-                os.path.join(self.master_base_dir, "*.crt"),
+                self.path_join(self.master_base_dir, "*.crt"),
             ])
 
             if self.is_static_pod_compatible():
-                self.add_copy_spec(os.path.join(self.static_pod_dir, "*.yaml"))
+                self.add_copy_spec(self.path_join(self.static_pod_dir,
+                                                  "*.yaml"))
                 self.add_cmd_output([
                     "%s api api" % static_pod_logs_cmd,
                     "%s controllers controllers" % static_pod_logs_cmd,
                 ])
+
+            if self.is_static_etcd():
+                self.add_cmd_output("%s etcd etcd" % static_pod_logs_cmd)
 
             # TODO: some thoughts about information that might also be useful
             # to collect. However, these are maybe not needed in general
@@ -129,9 +125,9 @@ class OpenShiftOrigin(Plugin):
             # is already collected by the Kubernetes plugin
 
             subcmds = [
-                "describe projects",
                 "adm top images",
-                "adm top imagestreams"
+                "adm top imagestreams",
+                "adm top nodes"
             ]
 
             self.add_cmd_output([
@@ -148,29 +144,23 @@ class OpenShiftOrigin(Plugin):
                 '%s get -o json %s' % (oc_cmd_admin, jcmd) for jcmd in jcmds
             ])
 
-            if self.get_option('all-namespaces'):
-                ocn = self.exec_cmd('%s get namespaces' % oc_cmd_admin)
-                ns_output = ocn['output'].splitlines()[1:]
-                nmsps = [n.split()[0] for n in ns_output if n]
-            else:
-                nmsps = [
-                    'default',
-                    'openshift-web-console',
-                    'openshift-ansible-service-broker'
-                ]
+            nmsps = [
+                'default',
+                'openshift-web-console',
+                'openshift-ansible-service-broker',
+                'openshift-sdn',
+                'openshift-console'
+            ]
 
             self.add_cmd_output([
-                '%s get -o json dc -n %s' % (oc_cmd_admin, n) for n in nmsps
+                '%s get -o json deploymentconfig,deployment,daemonsets -n %s'
+                % (oc_cmd_admin, n) for n in nmsps
             ])
 
-            if self.get_option('diag'):
-                diag_cmd = "%s adm diagnostics -l 0" % oc_cmd_admin
-                if self.get_option('diag-prevent'):
-                    diag_cmd += " --prevent-modification=true"
-                self.add_cmd_output(diag_cmd)
-            self.add_journal(units=["atomic-openshift-master",
-                                    "atomic-openshift-master-api",
-                                    "atomic-openshift-master-controllers"])
+            if not self.is_static_pod_compatible():
+                self.add_journal(units=["atomic-openshift-master",
+                                        "atomic-openshift-master-api",
+                                        "atomic-openshift-master-controllers"])
 
             # get logs from the infrastruture pods running in the default ns
             pods = self.exec_cmd("%s get pod -o name -n default"
@@ -189,15 +179,12 @@ class OpenShiftOrigin(Plugin):
                 node_client_ca,
                 bstrap_node_cfg,
                 bstrap_kubeconfig,
-                os.path.join(self.node_base_dir, "*.crt"),
-                os.path.join(self.node_base_dir, "resolv.conf"),
-                os.path.join(self.node_base_dir, "node-dnsmasq.conf"),
+                self.path_join(self.node_base_dir, "*.crt"),
+                self.path_join(self.node_base_dir, "resolv.conf"),
+                self.path_join(self.node_base_dir, "node-dnsmasq.conf"),
             ])
 
             self.add_journal(units="atomic-openshift-node")
-
-        if self.is_static_etcd():
-            self.add_cmd_output("%s etcd etcd" % static_pod_logs_cmd)
 
     def postproc(self):
         # Clear env values from objects that can contain sensitive data

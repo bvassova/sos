@@ -61,7 +61,7 @@ class Yum(Plugin, RedHatPlugin):
                 if not p.endswith(".py"):
                     continue
                 plugins = plugins + " " if len(plugins) else ""
-                plugins = plugins + os.path.join(YUM_PLUGIN_PATH, p)
+                plugins = plugins + self.path_join(YUM_PLUGIN_PATH, p)
             if len(plugins):
                 self.add_cmd_output("rpm -qf %s" % plugins,
                                     suggest_filename="plugin-packages")
@@ -69,7 +69,8 @@ class Yum(Plugin, RedHatPlugin):
                     os.path.basename(p)[:-3] for p in plugins.split()
                 ]
                 plugnames = "%s\n" % "\n".join(plugnames)
-                self.add_string_as_file(plugnames, "plugin-names")
+                self.add_string_as_file(plugnames, "plugin-names",
+                                        plug_dir=True)
 
         self.add_copy_spec("/etc/yum/pluginconf.d")
 

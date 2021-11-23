@@ -13,7 +13,7 @@
 from sos.utilities import (sos_get_command_output, import_module, grep,
                            fileobj, tail, is_executable, TIMEOUT_DEFAULT,
                            path_exists, path_isdir, path_isfile, path_islink,
-                           listdir)
+                           listdir, path_join)
 
 import os
 import glob
@@ -335,7 +335,7 @@ class SoSPredicate(object):
         ]
         return " ".join(msg).lstrip()
 
-    def __nonzero__(self):
+    def __bool__(self):
         """Predicate evaluation hook.
         """
 
@@ -348,11 +348,6 @@ class SoSPredicate(object):
                  self._eval_packages() and self._eval_cmd_outputs() and
                  self._eval_arch())
                 and not self.dry_run)
-
-    def __bool__(self):
-        # Py3 evaluation ends in a __bool__() call where py2 ends in a call
-        # to __nonzero__(). Wrap the latter here, to support both versions
-        return self.__nonzero__()
 
     def __init__(self, owner, dry_run=False, kmods=[], services=[],
                  packages=[], cmd_outputs=[], arch=[], required={}):
@@ -553,14 +548,6 @@ class Plugin():
     # Default predicates
     predicate = None
     cmd_predicate = None
-    _default_plug_opts = {
-        'timeout': PluginOpt('timeout', default=-1, val_type=int,
-                             desc='Timeout in seconds for plugin to finish'),
-        'cmd-timeout': PluginOpt('cmd-timeout', default=-1, val_type=int,
-                                 desc='Timeout in seconds for cmds to finish'),
-        'postproc': PluginOpt('postproc', default=True, val_type=bool,
-                              desc='Enable post-processing of collected data')
-    }
 
     def __init__(self, commons):
 
@@ -586,7 +573,7 @@ class Plugin():
             else logging.getLogger('sos')
 
         # add the default plugin opts
-        self.options.update(self._default_plug_opts)
+        self.options.update(self.get_default_plugin_opts())
         for popt in self.options:
             self.options[popt].plugin = self.name()
         for opt in self.option_list:
@@ -595,6 +582,22 @@ class Plugin():
 
         # Initialise the default --dry-run predicate
         self.set_predicate(SoSPredicate(self))
+
+    def get_default_plugin_opts(self):
+        return {
+            'timeout': PluginOpt(
+                'timeout', default=-1, val_type=int,
+                desc='Timeout in seconds for plugin to finish all collections'
+            ),
+            'cmd-timeout': PluginOpt(
+                'cmd-timeout', default=-1, val_type=int,
+                desc='Timeout in seconds for individual commands to finish'
+            ),
+            'postproc': PluginOpt(
+                'postproc', default=True, val_type=bool,
+                desc='Enable post-processing of collected data'
+            )
+        }
 
     def set_plugin_manifest(self, manifest):
         """Pass in a manifest object to the plugin to write to
@@ -610,9 +613,12 @@ class Plugin():
         self.manifest.add_field('setup_start', '')
         self.manifest.add_field('setup_end', '')
         self.manifest.add_field('setup_time', '')
+        self.manifest.add_field('timeout', self.timeout)
         self.manifest.add_field('timeout_hit', False)
+        self.manifest.add_field('command_timeout', self.cmdtimeout)
         self.manifest.add_list('commands', [])
         self.manifest.add_list('files', [])
+        self.manifest.add_field('strings', {})
 
     def timeout_from_options(self, optname, plugoptname, default_timeout):
         """Returns either the default [plugin|cmd] timeout value, the value as
@@ -706,19 +712,6 @@ class Plugin():
 
     def _log_debug(self, msg):
         self.soslog.debug(self._format_msg(msg))
-
-    def join_sysroot(self, path):
-        """Join a given path with the configured sysroot
-
-        :param path:    The filesystem path that needs to be joined
-        :type path: ``str``
-
-        :returns: The joined filesystem path
-        :rtype: ``str``
-        """
-        if path[0] == os.sep:
-            path = path[1:]
-        return os.path.join(self.sysroot, path)
 
     def strip_sysroot(self, path):
         """Remove the configured sysroot from a filesystem path
@@ -888,8 +881,7 @@ class Plugin():
             return bool(pred)
         return False
 
-    def log_skipped_cmd(self, pred, cmd, kmods=False, services=False,
-                        changes=False):
+    def log_skipped_cmd(self, cmd, pred, changes=False):
         """Log that a command was skipped due to predicate evaluation.
 
         Emit a warning message indicating that a command was skipped due
@@ -899,21 +891,17 @@ class Plugin():
         message indicating that the missing data can be collected by using
         the "--allow-system-changes" command line option will be included.
 
-        :param pred:    The predicate that caused the command to be skipped
-        :type pred:     ``SoSPredicate``
-
         :param cmd:     The command that was skipped
         :type cmd:      ``str``
 
-        :param kmods:   Did kernel modules cause the command to be skipped
-        :type kmods:    ``bool``
-
-        :param services: Did services cause the command to be skipped
-        :type services: ``bool``
+        :param pred:    The predicate that caused the command to be skipped
+        :type pred:     ``SoSPredicate``
 
         :param changes: Is the `--allow-system-changes` enabled
         :type changes:  ``bool``
         """
+        if pred is None:
+            pred = SoSPredicate(self)
         msg = "skipped command '%s': %s" % (cmd, pred.report_failure())
 
         if changes:
@@ -1175,7 +1163,7 @@ class Plugin():
 
     def _get_dest_for_srcpath(self, srcpath):
         if self.use_sysroot():
-            srcpath = self.join_sysroot(srcpath)
+            srcpath = self.path_join(srcpath)
         for copied in self.copied_files:
             if srcpath == copied["srcpath"]:
                 return copied["dstpath"]
@@ -1283,7 +1271,7 @@ class Plugin():
             forbidden = [forbidden]
 
         if self.use_sysroot():
-            forbidden = [self.join_sysroot(f) for f in forbidden]
+            forbidden = [self.path_join(f) for f in forbidden]
 
         for forbid in forbidden:
             self._log_info("adding forbidden path '%s'" % forbid)
@@ -1437,7 +1425,7 @@ class Plugin():
             since = self.get_option('since')
 
         logarchive_pattern = re.compile(r'.*((\.(zip|gz|bz2|xz))|[-.][\d]+)$')
-        configfile_pattern = re.compile(r"^%s/*" % self.join_sysroot("etc"))
+        configfile_pattern = re.compile(r"^%s/*" % self.path_join("etc"))
 
         if not self.test_predicate(pred=pred):
             self._log_info("skipped copy spec '%s' due to predicate (%s)" %
@@ -1467,7 +1455,7 @@ class Plugin():
                 return False
 
             if self.use_sysroot():
-                copyspec = self.join_sysroot(copyspec)
+                copyspec = self.path_join(copyspec)
 
             files = self._expand_copy_spec(copyspec)
 
@@ -1682,7 +1670,7 @@ class Plugin():
                 if not _dev_ok:
                     continue
                 if prepend_path:
-                    device = os.path.join(prepend_path, device)
+                    device = self.path_join(prepend_path, device)
                 _cmd = cmd % {'dev': device}
                 self._add_cmd_output(cmd=_cmd, timeout=timeout,
                                      sizelimit=sizelimit, chroot=chroot,
@@ -1710,9 +1698,7 @@ class Plugin():
             self.collect_cmds.append(soscmd)
             self._log_info("added cmd output '%s'" % soscmd.cmd)
         else:
-            self.log_skipped_cmd(pred, soscmd.cmd, kmods=bool(pred.kmods),
-                                 services=bool(pred.services),
-                                 changes=soscmd.changes)
+            self.log_skipped_cmd(soscmd.cmd, pred, changes=soscmd.changes)
 
     def add_cmd_output(self, cmds, suggest_filename=None,
                        root_symlink=None, timeout=None, stderr=True,
@@ -1919,7 +1905,8 @@ class Plugin():
             # adds a mixed case variable name, still get that as well
             self._env_vars.update([env, env.upper(), env.lower()])
 
-    def add_string_as_file(self, content, filename, pred=None):
+    def add_string_as_file(self, content, filename, pred=None, plug_dir=False,
+                           tags=[]):
         """Add a string to the archive as a file
 
         :param content: The string to write to the archive
@@ -1931,6 +1918,14 @@ class Plugin():
         :param pred: A predicate to gate if the string should be added to the
                      archive or not
         :type pred: ``SoSPredicate``
+
+        :param plug_dir: Should the string be saved under the plugin's dir in
+                         sos_commands/? If false, save to sos_strings/
+        :type plug_dir: ``bool`
+
+        :param tags: A tag or set of tags to add to the manifest entry for this
+                     collection
+        :type tags: ``str`` or a ``list`` of strings
         """
 
         # Generate summary string for logging
@@ -1943,7 +1938,13 @@ class Plugin():
                            (summary, self.get_predicate(pred=pred)))
             return
 
-        self.copy_strings.append((content, filename))
+        sos_dir = 'sos_commands' if plug_dir else 'sos_strings'
+        filename = os.path.join(sos_dir, self.name(), filename)
+
+        if isinstance(tags, str):
+            tags = [tags]
+
+        self.copy_strings.append((content, filename, tags))
         self._log_debug("added string ...'%s' as '%s'" % (summary, filename))
 
     def _collect_cmd_output(self, cmd, suggest_filename=None,
@@ -2107,7 +2108,7 @@ class Plugin():
                            root_symlink=False, timeout=None,
                            stderr=True, chroot=True, runat=None, env=None,
                            binary=False, sizelimit=None, pred=None,
-                           subdir=None, tags=[]):
+                           changes=False, subdir=None, tags=[]):
         """Execute a command and save the output to a file for inclusion in the
         report, then return the results for further use by the plugin
 
@@ -2158,8 +2159,7 @@ class Plugin():
         :rtype: ``dict``
         """
         if not self.test_predicate(cmd=True, pred=pred):
-            self._log_info("skipped cmd output '%s' due to predicate (%s)" %
-                           (cmd, self.get_predicate(cmd=True, pred=pred)))
+            self.log_skipped_cmd(cmd, pred, changes=changes)
             return {
                 'status': None,  # don't match on if result['status'] checks
                 'output': '',
@@ -2371,20 +2371,32 @@ class Plugin():
             return _runtime.volumes
         return []
 
-    def get_container_logs(self, container, **kwargs):
-        """Helper to get the ``logs`` output for a given container
+    def add_container_logs(self, containers, get_all=False, **kwargs):
+        """Helper to get the ``logs`` output for a given container or list
+        of container names and/or regexes.
 
         Supports passthru of add_cmd_output() options
 
-        :param container:   The name of the container to retrieve logs from
-        :type container: ``str``
+        :param containers:   The name of the container to retrieve logs from,
+                             may be a single name or a regex
+        :type containers:    ``str`` or ``list` of strs
+
+        :param get_all:     Should non-running containers also be queried?
+                            Default: False
+        :type get_all:      ``bool``
 
         :param kwargs:      Any kwargs supported by ``add_cmd_output()`` are
                             supported here
         """
         _runtime = self._get_container_runtime()
         if _runtime is not None:
-            self.add_cmd_output(_runtime.get_logs_command(container), **kwargs)
+            if isinstance(containers, str):
+                containers = [containers]
+            for container in containers:
+                _cons = self.get_all_containers_by_regex(container, get_all)
+                for _con in _cons:
+                    cmd = _runtime.get_logs_command(_con[1])
+                    self.add_cmd_output(cmd, **kwargs)
 
     def fmt_container_cmd(self, container, cmd, quotecmd=False):
         """Format a command to be executed by the loaded ``ContainerRuntime``
@@ -2574,7 +2586,7 @@ class Plugin():
                     if self.path_isfile(path) or self.path_islink(path):
                         found_paths.append(path)
                     elif self.path_isdir(path) and self.listdir(path):
-                        found_paths.extend(__expand(os.path.join(path, '*')))
+                        found_paths.extend(__expand(self.path_join(path, '*')))
                     else:
                         found_paths.append(path)
                 except PermissionError:
@@ -2590,7 +2602,7 @@ class Plugin():
         if (os.access(copyspec, os.R_OK) and self.path_isdir(copyspec) and
                 self.listdir(copyspec)):
             # the directory exists and is non-empty, recurse through it
-            copyspec = os.path.join(copyspec, '*')
+            copyspec = self.path_join(copyspec, '*')
         expanded = glob.glob(copyspec, recursive=True)
         recursed_files = []
         for _path in expanded:
@@ -2622,7 +2634,7 @@ class Plugin():
             self._collect_cmd_output(**soscmd.__dict__)
 
     def _collect_strings(self):
-        for string, file_name in self.copy_strings:
+        for string, file_name, tags in self.copy_strings:
             if self._timeout_hit:
                 return
             content = ''
@@ -2633,10 +2645,12 @@ class Plugin():
             self._log_info("collecting string ...'%s' as '%s'"
                            % (content, file_name))
             try:
-                self.archive.add_string(string,
-                                        os.path.join('sos_strings',
-                                                     self.name(),
-                                                     file_name))
+                self.archive.add_string(string, file_name)
+                _name = file_name.split('/')[-1].replace('.', '_')
+                self.manifest.strings[_name] = {
+                    'path': file_name,
+                    'tags': tags
+                }
             except Exception as e:
                 self._log_debug("could not add string '%s': %s"
                                 % (file_name, e))
@@ -2711,8 +2725,8 @@ class Plugin():
                                                    # SCL containers don't exist
                                                    ()):
                         type(self)._scls_matched.append(scl)
-                    if type(self)._scls_matched:
-                        return True
+                if type(self)._scls_matched:
+                    return True
 
             return self._check_plugin_triggers(self.files,
                                                self.packages,
@@ -2857,6 +2871,20 @@ class Plugin():
         """
         return listdir(path, self.commons['cmdlineopts'].sysroot)
 
+    def path_join(self, path, *p):
+        """Helper to call the sos.utilities wrapper that allows the
+        corresponding `os` call to account for sysroot
+
+        :param path:    The leading path passed to os.path.join()
+        :type path:     ``str``
+
+        :param p:       Following path section(s) to be joined with ``path``,
+                        an empty parameter will result in a path that ends with
+                        a separator
+        :type p:        ``str``
+        """
+        return path_join(path, *p, sysroot=self.sysroot)
+
     def postproc(self):
         """Perform any postprocessing. To be replaced by a plugin if required.
         """
@@ -2876,7 +2904,7 @@ class Plugin():
         try:
             cmd_line_paths = glob.glob(cmd_line_glob)
             for path in cmd_line_paths:
-                f = open(path, 'r')
+                f = open(self.path_join(path), 'r')
                 cmd_line = f.read().strip()
                 if process in cmd_line:
                     status = True
@@ -2925,21 +2953,20 @@ class Plugin():
                 )
         for ns in ns_list:
             # if ns_pattern defined, skip namespaces not matching the pattern
-            if ns_pattern:
-                if not bool(re.match(pattern, ns)):
-                    continue
+            if ns_pattern and not bool(re.match(pattern, ns)):
+                continue
+            out_ns.append(ns)
 
-            # if ns_max is defined at all, limit returned list to that number
+            # if ns_max is defined at all, break the loop when the limit is
+            # reached
             # this allows the use of both '0' and `None` to mean unlimited
-            elif ns_max:
-                out_ns.append(ns)
+            if ns_max:
                 if len(out_ns) == ns_max:
                     self._log_warn("Limiting namespace iteration "
                                    "to first %s namespaces found"
                                    % ns_max)
                     break
-            else:
-                out_ns.append(ns)
+
         return out_ns
 
 
@@ -2983,24 +3010,9 @@ class SCLPlugin(RedHatPlugin):
         return [scl.strip() for scl in output.splitlines()]
 
     def convert_cmd_scl(self, scl, cmd):
-        """wrapping command in "scl enable" call and adds proper PATH
+        """wrapping command in "scl enable" call
         """
-        # load default SCL prefix to PATH
-        prefix = self.policy.get_default_scl_prefix()
-        # read prefix from /etc/scl/prefixes/${scl} and strip trailing '\n'
-        try:
-            prefix = open('/etc/scl/prefixes/%s' % scl, 'r').read()\
-                     .rstrip('\n')
-        except Exception as e:
-            self._log_error("Failed to find prefix for SCL %s using %s: %s"
-                            % (scl, prefix, e))
-
-        # expand PATH by equivalent prefixes under the SCL tree
-        path = os.environ["PATH"]
-        for p in path.split(':'):
-            path = '%s/%s%s:%s' % (prefix, scl, p, path)
-
-        scl_cmd = "scl enable %s \"PATH=%s %s\"" % (scl, path, cmd)
+        scl_cmd = "scl enable %s \"%s\"" % (scl, cmd)
         return scl_cmd
 
     def add_cmd_output_scl(self, scl, cmds, **kwargs):

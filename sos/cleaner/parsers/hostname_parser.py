@@ -8,6 +8,8 @@
 #
 # See the LICENSE file in the source distribution for further information.
 
+import re
+
 from sos.cleaner.parsers import SoSCleanerParser
 from sos.cleaner.mappings.hostname_map import SoSHostnameMap
 
@@ -16,7 +18,6 @@ class SoSHostnameParser(SoSCleanerParser):
 
     name = 'Hostname Parser'
     map_file_key = 'hostname_map'
-    prep_map_file = 'sos_commands/host/hostname'
     regex_patterns = [
         r'(((\b|_)[a-zA-Z0-9-\.]{1,200}\.[a-zA-Z]{1,63}(\b|_)))'
     ]
@@ -62,6 +63,25 @@ class SoSHostnameParser(SoSCleanerParser):
             self.mapping.add(high_domain)
         self.mapping.add(hostname_string)
 
+    def load_hostname_from_etc_hosts(self, content):
+        """Parse an archive's copy of /etc/hosts, which requires handling that
+        is separate from the output of the `hostname` command. Just like
+        load_hostname_into_map(), this has to be done explicitly and we
+        cannot rely upon the more generic methods to do this reliably.
+        """
+        lines = content.splitlines()
+        for line in lines:
+            if line.startswith('#') or 'localhost' in line:
+                continue
+            hostln = line.split()[1:]
+            for host in hostln:
+                if len(host.split('.')) == 1:
+                    # only generate a mapping for fqdns but still record the
+                    # short name here for later obfuscation with parse_line()
+                    self.short_names.append(host)
+                else:
+                    self.mapping.add(host)
+
     def parse_line(self, line):
         """Override the default parse_line() method to also check for the
         shortname of the host derived from the hostname.
@@ -73,9 +93,9 @@ class SoSHostnameParser(SoSCleanerParser):
             """
             if search in self.mapping.skip_keys:
                 return ln, count
-            if search in ln:
-                count += ln.count(search)
-                ln = ln.replace(search, self.mapping.get(repl or search))
+            _reg = re.compile(search, re.I)
+            if _reg.search(ln):
+                return _reg.subn(self.mapping.get(repl or search), ln)
             return ln, count
 
         count = 0

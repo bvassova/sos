@@ -68,9 +68,9 @@ class RedHatPython(Python, RedHatPlugin):
             ]
 
             for py_path in py_paths:
-                for root, _, files in os.walk(py_path):
+                for root, _, files in os.walk(self.path_join(py_path)):
                     for file_ in files:
-                        filepath = os.path.join(root, file_)
+                        filepath = self.path_join(root, file_)
                         if filepath.endswith('.py'):
                             try:
                                 with open(filepath, 'rb') as f:
@@ -95,6 +95,7 @@ class RedHatPython(Python, RedHatPlugin):
                                     filepath
                                 )
 
-            self.add_string_as_file(json.dumps(digests), 'digests.json')
+            self.add_string_as_file(json.dumps(digests), 'digests.json',
+                                    plug_dir=True)
 
 # vim: set et ts=4 sw=4 :

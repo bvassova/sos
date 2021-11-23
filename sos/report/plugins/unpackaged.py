@@ -40,7 +40,7 @@ class Unpackaged(Plugin, RedHatPlugin):
                     for e in exclude:
                         dirs[:] = [d for d in dirs if d not in e]
                 for name in files:
-                    path = os.path.join(root, name)
+                    path = self.path_join(root, name)
                     try:
                         if stat.S_ISLNK(os.lstat(path).st_mode):
                             path = Path(path).resolve()
@@ -49,7 +49,7 @@ class Unpackaged(Plugin, RedHatPlugin):
                     file_list.append(os.path.realpath(path))
                 for name in dirs:
                     file_list.append(os.path.realpath(
-                                     os.path.join(root, name)))
+                                     self.path_join(root, name)))
 
             return file_list
 
@@ -80,6 +80,7 @@ class Unpackaged(Plugin, RedHatPlugin):
             all_fsystem += all_files_system(d)
         not_packaged = [x for x in all_fsystem if x not in all_frpm]
         not_packaged_expanded = format_output(not_packaged)
-        self.add_string_as_file('\n'.join(not_packaged_expanded), 'unpackaged')
+        self.add_string_as_file('\n'.join(not_packaged_expanded), 'unpackaged',
+                                plug_dir=True)
 
 # vim: set et ts=4 sw=4 :
