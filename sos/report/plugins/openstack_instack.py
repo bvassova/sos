@@ -44,14 +44,16 @@ class OpenStackInstack(Plugin):
 
         if self.get_option("all_logs"):
             self.add_copy_spec([
-                "/var/log/mistral/",
                 "/var/log/zaqar/",
             ])
         else:
             self.add_copy_spec([
-                "/var/log/mistral/*.log",
                 "/var/log/zaqar/*.log",
             ])
+
+        self.add_file_tags({
+            "/var/log/mistral/executor.log": "mistral_executor_log"
+        })
 
         vars_all = [p in os.environ for p in [
                     'OS_USERNAME', 'OS_PASSWORD']]
@@ -81,16 +83,17 @@ class OpenStackInstack(Plugin):
             # capture all the possible stack uuids
             get_stacks = "openstack stack list"
             stacks = self.collect_cmd_output(get_stacks)['output']
-            stack_ids = re.findall(r'(\s(\w+-\w+)+\s)', stacks)
+            stack_ids = re.findall(r'(\|\s(((\w+-){4})\w+)\s\|)', stacks)
             # get status of overcloud stack and resources
-            for sid in stack_ids:
+            for _sid in stack_ids:
+                sid = _sid[1]
                 self.add_cmd_output([
-                    "openstack stack show %s" % sid[0],
-                    "openstack stack resource list -n 10 %s" % sid[0]
+                    "openstack stack show %s" % sid,
+                    "openstack stack resource list -n 10 %s" % sid
                 ])
 
                 # get details on failed deployments
-                cmd = "openstack stack resource list -f value -n 5 %s" % sid[0]
+                cmd = "openstack stack resource list -f value -n 5 %s" % sid
                 deployments = self.exec_cmd(cmd)
                 for deployment in deployments['output'].splitlines():
                     if 'FAILED' in deployment:
@@ -110,35 +113,33 @@ class OpenStackInstack(Plugin):
                                 "tripleo-ui-logs tripleo-ui.logs --file -")
 
     def postproc(self):
+        # do_file_sub is case insensitive, so protected_keys can be lowercase
+        # only
         protected_keys = [
-            "UNDERCLOUD_TUSKAR_PASSWORD", "UNDERCLOUD_ADMIN_PASSWORD",
-            "UNDERCLOUD_CEILOMETER_METERING_SECRET",
-            "UNDERCLOUD_CEILOMETER_PASSWORD",
-            "UNDERCLOUD_CEILOMETER_SNMPD_PASSWORD",
-            "UNDERCLOUD_DB_PASSWORD", "UNDERCLOUD_GLANCE_PASSWORD",
-            "UNDERCLOUD_HEAT_PASSWORD",
-            "UNDERCLOUD_HEAT_STACK_DOMAIN_ADMIN_PASSWORD",
-            "UNDERCLOUD_HORIZON_SECRET_KEY", "UNDERCLOUD_IRONIC_PASSWORD",
-            "UNDERCLOUD_NEUTRON_PASSWORD", "UNDERCLOUD_NOVA_PASSWORD",
-            "UNDERCLOUD_RABBIT_PASSWORD", "UNDERCLOUD_SWIFT_PASSWORD",
-            "UNDERCLOUD_TUSKAR_PASSWORD", "OS_PASSWORD",
-            "undercloud_db_password", "undercloud_admin_password",
-            "undercloud_glance_password", "undercloud_heat_password",
-            "undercloud_neutron_password", "undercloud_nova_password",
-            "undercloud_ironic_password", "undercloud_tuskar_password",
-            "undercloud_ceilometer_password",
+            "os_password",
+            "undercloud_admin_password",
             "undercloud_ceilometer_metering_secret",
+            "undercloud_ceilometer_password",
             "undercloud_ceilometer_snmpd_password",
-            "undercloud_swift_password", "undercloud_rabbit_password",
-            "undercloud_heat_stack_domain_admin_password"
+            "undercloud_db_password",
+            "undercloud_glance_password",
+            "undercloud_heat_password",
+            "undercloud_heat_stack_domain_admin_password",
+            "undercloud_horizon_secret_key",
+            "undercloud_ironic_password",
+            "undercloud_neutron_password",
+            "undercloud_nova_password",
+            "undercloud_rabbit_password",
+            "undercloud_swift_password",
+            "undercloud_tuskar_password",
         ]
-        regexp = r"((?m)(%s)=)(.*)" % "|".join(protected_keys)
+        regexp = r"((%s)=)(.*)" % "|".join(protected_keys)
         self.do_file_sub("/home/stack/.instack/install-undercloud.log",
                          regexp, r"\1*********")
         self.do_file_sub(UNDERCLOUD_CONF_PATH, regexp, r"\1*********")
 
         protected_json_keys = ["pm_password", "ssh-key", "password"]
-        json_regexp = r'((?m)"(%s)": )(".*?")' % "|".join(protected_json_keys)
+        json_regexp = r'("(%s)": )(".*?")' % "|".join(protected_json_keys)
         self.do_file_sub("/home/stack/instackenv.json", json_regexp,
                          r"\1*********")
         self.do_file_sub('/home/stack/.tripleo/history',

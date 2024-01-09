@@ -10,11 +10,19 @@ from sos.report.plugins import Plugin, IndependentPlugin
 
 
 class Xfs(Plugin, IndependentPlugin):
+    """This plugin collects information on mounted XFS filessystems on the
+    local system.
+
+    Users should expect `xfs_info` and `xfs_admin` collections by this plugin
+    for each XFS filesystem that is locally mounted.
+    """
 
     short_desc = 'XFS filesystem'
 
     plugin_name = 'xfs'
     profiles = ('storage',)
+    files = ('/sys/fs/xfs', '/proc/fs/xfs')
+    kernel_mods = ('xfs',)
 
     def setup(self):
         mounts = '/proc/mounts'
@@ -22,7 +30,8 @@ class Xfs(Plugin, IndependentPlugin):
         for dev in zip(self.do_regex_find_all(ext_fs_regex, mounts)):
             for e in dev:
                 parts = e.split(' ')
-                self.add_cmd_output("xfs_info %s" % (parts[1]))
+                self.add_cmd_output("xfs_info %s" % (parts[1]),
+                                    tags="xfs_info")
                 self.add_cmd_output("xfs_admin -l -u %s" % (parts[0]))
 
         self.add_copy_spec([

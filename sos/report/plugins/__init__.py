@@ -13,8 +13,11 @@
 from sos.utilities import (sos_get_command_output, import_module, grep,
                            fileobj, tail, is_executable, TIMEOUT_DEFAULT,
                            path_exists, path_isdir, path_isfile, path_islink,
-                           listdir, path_join)
+                           listdir, path_join, bold, file_is_binary,
+                           recursive_dict_values_by_key)
 
+from sos.archive import P_FILE, P_LINK
+import contextlib
 import os
 import glob
 import re
@@ -23,6 +26,7 @@ from time import time
 import logging
 import fnmatch
 import errno
+import textwrap
 
 from datetime import datetime
 
@@ -44,11 +48,6 @@ def _mangle_command(command, name_max):
     return mangledname
 
 
-def _path_in_path_list(path, path_list):
-    return any((p == path or path.startswith(os.path.abspath(p)+os.sep)
-                for p in path_list))
-
-
 def _node_type(st):
     """ return a string indicating the type of special node represented by
     the stat buffer st (block, character, fifo, socket).
@@ -62,16 +61,7 @@ def _node_type(st):
     for t in _types:
         if t[0](st.st_mode):
             return t[1]
-
-
-def _file_is_compressed(path):
-    """Check if a file appears to be compressed
-
-    Return True if the file specified by path appears to be compressed,
-    or False otherwise by testing the file name extension against a
-    list of known file compression extentions.
-    """
-    return path.endswith(('.gz', '.xz', '.bz', '.bz2'))
+    return ''
 
 
 _certmatch = re.compile("-*BEGIN.*?-*END", re.DOTALL)
@@ -198,6 +188,10 @@ class SoSPredicate(object):
             return all(items)
         elif required == 'none':
             return not any(items)
+        raise ValueError(
+            f"predicate requires must be 'any', 'all', or 'none' "
+            f"not {required}"
+        )
 
     def _failed_or_forbidden(self, test, item):
         """Helper to direct failed predicates to provide the proper messaging
@@ -460,7 +454,11 @@ class PluginOpt():
         return self.__str__()
 
     def set_value(self, val):
-        if not any([type(val) == _t for _t in self.val_type]):
+        # 'str' type accepts any value, incl. numbers
+        if type('') in self.val_type:
+            self.value = str(val)
+            return
+        if not any([type(val) is _t for _t in self.val_type]):
             valid = []
             for t in self.val_type:
                 if t is None:
@@ -559,6 +557,7 @@ class Plugin():
         self.commons = commons
         self.forbidden_paths = []
         self.copy_paths = set()
+        self.container_copy_paths = []
         self.copy_strings = []
         self.collect_cmds = []
         self.options = {}
@@ -568,6 +567,8 @@ class Plugin():
         self.manifest = None
         self.skip_files = commons['cmdlineopts'].skip_files
         self.skip_commands = commons['cmdlineopts'].skip_commands
+        self.default_environment = {}
+        self._tail_files_list = []
 
         self.soslog = self.commons['soslog'] if 'soslog' in self.commons \
             else logging.getLogger('sos')
@@ -619,11 +620,77 @@ class Plugin():
         self.manifest.add_list('commands', [])
         self.manifest.add_list('files', [])
         self.manifest.add_field('strings', {})
+        self.manifest.add_field('containers', {})
+        self.manifest.add_list('collections', [])
+
+    def set_default_cmd_environment(self, env_vars):
+        """
+        Specify a collection of environment variables that should always be
+        passed to commands being executed by this plugin.
+
+        :param env_vars:    The environment variables and their values to set
+        :type env_vars:     ``dict{ENV_VAR_NAME: ENV_VAR_VALUE}``
+        """
+        if not isinstance(env_vars, dict):
+            raise TypeError(
+                "Environment variables for Plugin must be specified by dict"
+            )
+        self.default_environment = env_vars
+        self._log_debug("Default environment for all commands now set to %s"
+                        % self.default_environment)
+
+    def add_default_cmd_environment(self, env_vars):
+        """
+        Add or modify a specific environment variable in the set of default
+        environment variables used by this Plugin.
+
+        :param env_vars:    The environment variables to add to the current
+                            set of env vars in use
+        :type env_vars:     ``dict``
+        """
+        if not isinstance(env_vars, dict):
+            raise TypeError("Environment variables must be added via dict")
+        self._log_debug("Adding %s to default environment" % env_vars)
+        self.default_environment.update(env_vars)
+
+    def _get_cmd_environment(self, env=None):
+        """
+        Get the merged set of environment variables for a command about to be
+        executed by this plugin.
+
+        :returns: The set of env vars to use for a command
+        :rtype: ``dict``
+        """
+        if env is None:
+            return self.default_environment
+        if not isinstance(env, dict):
+            raise TypeError("Command env vars must be passed as dict")
+        _env = self.default_environment.copy()
+        _env.update(env)
+        return _env
 
     def timeout_from_options(self, optname, plugoptname, default_timeout):
-        """Returns either the default [plugin|cmd] timeout value, the value as
-        provided on the commandline via -k plugin.[|cmd-]timeout=value, or the
-        value of the global --[plugin|cmd]-timeout option.
+        """
+        Get the timeout value for either the plugin or a command, as
+        determined by either the value provided via the
+        plugin.timeout or plugin.cmd-timeout option, the global timeout or
+        cmd-timeout options, or the default value set by the plugin or the
+        collection, in that order of precendence.
+
+        :param optname: The name of the cmdline option being checked, either
+                        'plugin_timeout' or 'timeout'
+        :type optname:  ``str``
+
+        :param plugoptname: The name of the plugin option name being checked,
+                            either 'timeout' or 'cmd-timeout'
+        :type plugoptname: ``str``
+
+        :param default_timeout: The timeout to default to if determination is
+                                inconclusive or hits an error
+        :type default_timeout:  ``int``
+
+        :returns: The timeout value in seconds
+        :rtype:   ``int``
         """
         _timeout = None
         try:
@@ -632,7 +699,10 @@ class Plugin():
             if opt_timeout is None:
                 _timeout = own_timeout
             elif opt_timeout is not None and own_timeout == -1:
-                _timeout = int(opt_timeout)
+                if opt_timeout == TIMEOUT_DEFAULT:
+                    _timeout = default_timeout
+                else:
+                    _timeout = int(opt_timeout)
             elif opt_timeout is not None and own_timeout > -1:
                 _timeout = own_timeout
             else:
@@ -698,8 +768,180 @@ class Plugin():
             return cls.plugin_name
         return cls.__name__.lower()
 
+    @classmethod
+    def display_help(cls, section):
+        if cls.plugin_name is None:
+            cls.display_self_help(section)
+        else:
+            cls.display_plugin_help(section)
+
+    @classmethod
+    def display_plugin_help(cls, section):
+        from sos.help import TERMSIZE
+        section.set_title("%s Plugin Information - %s"
+                          % (cls.plugin_name.title(), cls.short_desc))
+        missing = '\nDetailed information is not available for this plugin.\n'
+
+        # Concatenate the docstrings of distro-specific plugins with their
+        # base classes, if available.
+        try:
+            _doc = ''
+            _sc = cls.__mro__[1]
+            if _sc != Plugin and _sc.__doc__:
+                _doc = _sc.__doc__
+            if cls.__doc__:
+                _doc += cls.__doc__
+        except Exception:
+            _doc = None
+
+        section.add_text('\n    %s' % _doc if _doc else missing)
+
+        if not any([cls.packages, cls.commands, cls.files, cls.kernel_mods,
+                    cls.services, cls.containers]):
+            section.add_text("This plugin is always enabled by default.")
+        else:
+            for trig in ['packages', 'commands', 'files', 'kernel_mods',
+                         'services']:
+                if getattr(cls, trig, None):
+                    section.add_text(
+                        "Enabled by %s: %s"
+                        % (trig, ', '.join(getattr(cls, trig))),
+                        newline=False
+                    )
+            if getattr(cls, 'containers'):
+                section.add_text(
+                    "Enabled by containers with names matching: %s"
+                    % ', '.join(c for c in cls.containers),
+                    newline=False
+                )
+
+        if cls.profiles:
+            section.add_text(
+                "Enabled with the following profiles: %s"
+                % ', '.join(p for p in cls.profiles),
+                newline=False
+            )
+
+        if hasattr(cls, 'verify_packages'):
+            section.add_text(
+                "\nVerfies packages (when using --verify): %s"
+                % ', '.join(pkg for pkg in cls.verify_packages),
+                newline=False,
+            )
+
+        if cls.postproc is not Plugin.postproc:
+            section.add_text(
+                'This plugin performs post-processing on potentially '
+                'sensitive collections. Disabling post-processing may'
+                ' leave sensitive data in plaintext.'
+            )
+
+        if not cls.option_list:
+            return
+
+        optsec = section.add_section('Plugin Options')
+        optsec.add_text(
+            "These options may be toggled or changed using '%s'"
+            % bold("-k %s.option_name=$value" % cls.plugin_name)
+        )
+        optsec.add_text(bold(
+            "\n{:<4}{:<20}{:<30}{:<20}\n".format(
+                ' ', "Option Name", "Default", "Description")
+            ), newline=False
+        )
+
+        opt_indent = ' ' * 54
+        for opt in cls.option_list:
+            _def = opt.default
+            # convert certain values to text meanings
+            if _def is None or _def == '':
+                _def = "None/Unset"
+            if isinstance(opt.default, bool):
+                if opt.default:
+                    _def = "True/On"
+                else:
+                    _def = "False/Off"
+            _ln = "{:<4}{:<20}{:<30}{:<20}".format(' ', opt.name, _def,
+                                                   opt.desc)
+            optsec.add_text(
+                textwrap.fill(_ln, width=TERMSIZE,
+                              subsequent_indent=opt_indent),
+                newline=False
+            )
+            if opt.long_desc:
+                _size = TERMSIZE - 10
+                space = ' ' * 8
+                optsec.add_text(
+                    textwrap.fill(opt.long_desc, width=_size,
+                                  initial_indent=space,
+                                  subsequent_indent=space),
+                    newline=False
+                )
+
+    @classmethod
+    def display_self_help(cls, section):
+        section.set_title("SoS Plugin Detailed Help")
+        section.add_text(
+            "Plugins are what define what collections occur for a given %s "
+            "execution. Plugins are generally representative of a single "
+            "system component (e.g. kernel), package (e.g. podman), or similar"
+            " construct. Plugins will typically specify multiple files or "
+            "directories to copy, as well as commands to execute and collect "
+            "the output of for further analysis."
+            % bold('sos report')
+        )
+
+        subsec = section.add_section('Plugin Enablement')
+        subsec.add_text(
+            'Plugins will be automatically enabled based on one of several '
+            'triggers - a certain package being installed, a command or file '
+            'existing, a kernel module being loaded, etc...'
+        )
+        subsec.add_text(
+            "Plugins may also be enabled or disabled by name using the %s or "
+            "%s options respectively."
+            % (bold('-e $name'), bold('-n $name'))
+        )
+
+        subsec.add_text(
+            "Certain plugins may only be available for specific distributions "
+            "or may behave differently on different distributions based on how"
+            " the component for that plugin is installed or how it operates."
+            " When using %s, help will be displayed for the version of the "
+            "plugin appropriate for your distribution."
+            % bold('sos help report.plugins.$plugin')
+        )
+
+        optsec = section.add_section('Using Plugin Options')
+        optsec.add_text(
+            "Many plugins support additional options to enable/disable or in "
+            "some other way modify the collections it makes. Plugin options "
+            "are set using the %s syntax. Options that are on/off toggles "
+            "may exclude setting a value, which will be interpreted as "
+            "enabling that option.\n\nSee specific plugin help sections "
+            "or %s for more information on these options"
+            % (bold('-k $plugin_name.$option_name=$value'),
+               bold('sos report -l'))
+        )
+
+        seealso = section.add_section('See Also')
+        _also = {
+            'report.plugins.$plugin': 'Help for a specific $plugin',
+            'policies': 'Information on distribution policies'
+        }
+        seealso.add_text(
+            "Additional relevant information may be available in these "
+            "help sections:\n\n%s" % "\n".join(
+                "{:>8}{:<30}{:<30}".format(' ', sec, desc)
+                for sec, desc in _also.items()
+            ), newline=False
+        )
+
     def _format_msg(self, msg):
-        return "[plugin:%s] %s" % (self.name(), msg)
+        return "[plugin:%s] %s" % (self.name(),
+                                   # safeguard against non-UTF logging, see
+                                   # #2790 for reference
+                                   msg.encode('utf-8', 'replace').decode())
 
     def _log_error(self, msg):
         self.soslog.error(self._format_msg(msg))
@@ -724,7 +966,7 @@ class Plugin():
         """
         if not self.use_sysroot():
             return path
-        if path.startswith(self.sysroot):
+        if self.sysroot and path.startswith(self.sysroot):
             return path[len(self.sysroot):]
         return path
 
@@ -743,8 +985,10 @@ class Plugin():
                   ``False``
         :rtype: ``bool``
         """
-        paths = [self.sysroot, self.archive.get_tmp_dir()]
-        return os.path.commonprefix(paths) == self.sysroot
+        # if sysroot is still None, that implies '/'
+        _sysroot = self.sysroot or '/'
+        paths = [_sysroot, self.archive.get_tmp_dir()]
+        return os.path.commonprefix(paths) == _sysroot
 
     def is_installed(self, package_name):
         """Is the package $package_name installed?
@@ -755,7 +999,9 @@ class Plugin():
         :returns: ``True`` id the package is installed, else ``False``
         :rtype: ``bool``
         """
-        return self.policy.pkg_by_name(package_name) is not None
+        return (
+            len(self.policy.package_manager.all_pkgs_by_name(package_name)) > 0
+        )
 
     def is_service(self, name):
         """Does the service $name exist on the system?
@@ -1033,7 +1279,13 @@ class Plugin():
         """
         try:
             path = self._get_dest_for_srcpath(srcpath)
-            pattern = regexp.pattern if hasattr(regexp, "pattern") else regexp
+            common_flags = re.IGNORECASE | re.MULTILINE
+            if hasattr(regexp, "pattern"):
+                pattern = regexp.pattern
+                flags = regexp.flags | common_flags
+            else:
+                pattern = regexp
+                flags = common_flags
             self._log_debug("substituting scrpath '%s'" % srcpath)
             self._log_debug("substituting '%s' for '%s' in '%s'"
                             % (subst, pattern, path))
@@ -1043,9 +1295,10 @@ class Plugin():
             content = readable.read()
             if not isinstance(content, str):
                 content = content.decode('utf8', 'ignore')
-            result, replacements = re.subn(regexp, subst, content)
+            result, replacements = re.subn(pattern, subst, content,
+                                           flags=flags)
             if replacements:
-                self.archive.add_string(result, srcpath)
+                self.archive.add_string(result, self.strip_sysroot(srcpath))
             else:
                 replacements = 0
         except (OSError, IOError) as e:
@@ -1138,7 +1391,11 @@ class Plugin():
 
         # skip recursive copying of symlink pointing to itself.
         if (absdest != srcpath):
-            self._do_copy_path(absdest)
+            # this allows for ensuring we collect the host's file when copying
+            # a symlink from within a container that is within the set sysroot
+            force = (absdest.startswith(self.sysroot) and
+                     self.policy._in_container)
+            self._do_copy_path(absdest, force=force)
         else:
             self._log_debug("link '%s' points to itself, skipping target..."
                             % linkdest)
@@ -1170,7 +1427,9 @@ class Plugin():
         return None
 
     def _is_forbidden_path(self, path):
-        return _path_in_path_list(path, self.forbidden_paths)
+        return any(
+            re.match(forbid, path) for forbid in self.forbidden_paths
+        )
 
     def _is_policy_forbidden_path(self, path):
         return any([
@@ -1198,17 +1457,17 @@ class Plugin():
         self.archive.add_node(path, mode, os.makedev(dev_maj, dev_min))
 
     # Methods for copying files and shelling out
-    def _do_copy_path(self, srcpath, dest=None):
+    def _do_copy_path(self, srcpath, dest=None, force=False):
         """Copy file or directory to the destination tree. If a directory, then
         everything below it is recursively copied. A list of copied files are
         saved for use later in preparing a report.
         """
         if self._timeout_hit:
-            return
+            return None
 
         if self._is_forbidden_path(srcpath):
             self._log_debug("skipping forbidden path '%s'" % srcpath)
-            return ''
+            return None
 
         if not dest:
             dest = srcpath
@@ -1220,19 +1479,19 @@ class Plugin():
             st = os.lstat(srcpath)
         except (OSError, IOError):
             self._log_info("failed to stat '%s'" % srcpath)
-            return
+            return None
 
         if stat.S_ISLNK(st.st_mode):
             self._copy_symlink(srcpath)
-            return
+            return None
         else:
             if stat.S_ISDIR(st.st_mode) and os.access(srcpath, os.R_OK):
                 # copy empty directory
                 if not self.listdir(srcpath):
                     self.archive.add_dir(dest)
-                    return
+                    return None
                 self._copy_dir(srcpath)
-                return
+                return None
 
         # handle special nodes (block, char, fifo, socket)
         if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
@@ -1240,7 +1499,7 @@ class Plugin():
             self._log_debug("creating %s node at archive:'%s'"
                             % (ntype, dest))
             self._copy_node(dest, st)
-            return
+            return None
 
         # if we get here, it's definitely a regular file (not a symlink or dir)
         self._log_debug("copying path '%s' to archive:'%s'" % (srcpath, dest))
@@ -1250,7 +1509,7 @@ class Plugin():
             # FIXME: reflect permissions in archive
             self.archive.add_string("", dest)
         else:
-            self.archive.add_file(srcpath, dest)
+            self.archive.add_file(srcpath, dest, force=force)
 
         self.copied_files.append({
             'srcpath': srcpath,
@@ -1258,14 +1517,14 @@ class Plugin():
             'symlink': "no"
         })
 
-    def add_forbidden_path(self, forbidden, recursive=False):
+        return None
+
+    def add_forbidden_path(self, forbidden):
         """Specify a path, or list of paths, to not copy, even if it's part of
         an ``add_copy_spec()`` call
 
         :param forbidden: A filepath to forbid collection from
         :type forbidden: ``str`` or a ``list`` of strings
-
-        :param recursive: Should forbidden glob be applied recursively
         """
         if isinstance(forbidden, str):
             forbidden = [forbidden]
@@ -1275,8 +1534,11 @@ class Plugin():
 
         for forbid in forbidden:
             self._log_info("adding forbidden path '%s'" % forbid)
-            for path in glob.glob(forbid, recursive=recursive):
-                self.forbidden_paths.append(path)
+            if "*" in forbid:
+                # calling translate() here on a dir-level path will break the
+                # re.match() call during path comparison
+                forbid = fnmatch.translate(forbid)
+            self.forbidden_paths.append(forbid)
 
     def set_option(self, optionname, value):
         """Set the named option to value. Ensure the original type of the
@@ -1317,8 +1579,8 @@ class Plugin():
         """
 
         global_options = (
-            'all_logs', 'allow_system_changes', 'cmd_timeout', 'log_size',
-            'plugin_timeout', 'since', 'verify'
+            'all_logs', 'allow_system_changes', 'cmd_timeout', 'journal_size',
+            'log_size', 'plugin_timeout', 'since', 'verify'
         )
 
         if optionname in global_options:
@@ -1361,10 +1623,11 @@ class Plugin():
         :returns:   The tag(s) associated with `fname`
         :rtype: ``list`` of strings
         """
+        tags = []
         for key, val in self.filetags.items():
             if re.match(key, fname):
-                return val
-        return []
+                tags.extend(val)
+        return tags
 
     def generate_copyspec_tags(self):
         """After file collections have completed, retroactively generate
@@ -1379,16 +1642,16 @@ class Plugin():
             matched_files = []
             for cfile in self.copied_files:
                 if re.match(file_regex, cfile['srcpath']):
-                    matched_files.append(cfile['dstpath'])
+                    matched_files.append(cfile['dstpath'].lstrip('/'))
             if matched_files:
                 manifest_data['files_copied'] = matched_files
                 self.manifest.files.append(manifest_data)
 
     def add_copy_spec(self, copyspecs, sizelimit=None, maxage=None,
-                      tailit=True, pred=None, tags=[]):
-        """Add a file, directory, or regex matching filepaths to the archive
+                      tailit=True, pred=None, tags=[], container=None):
+        """Add a file, directory, or globs matching filepaths to the archive
 
-        :param copyspecs: A file, directory, or regex matching filepaths
+        :param copyspecs: Files, directories, or globs matching filepaths
         :type copyspecs: ``str`` or a ``list`` of strings
 
         :param sizelimit: Limit the total size of collections from `copyspecs`
@@ -1410,9 +1673,16 @@ class Plugin():
                      for this collection
         :type tags: ``str`` or a ``list`` of strings
 
+        :param container: Container(s) from which this file should be copied
+        :type container: ``str`` or a ``list`` of strings
+
         `copyspecs` will be expanded and/or globbed as appropriate. Specifying
         a directory here will cause the plugin to attempt to collect the entire
         directory, recursively.
+
+        If `container` is specified, `copyspecs` may only be explicit paths,
+        not globs as currently container runtimes do not support glob expansion
+        as part of the copy operation.
 
         Note that `sizelimit` is applied to each `copyspec`, not each file
         individually. For example, a copyspec of
@@ -1430,7 +1700,7 @@ class Plugin():
         if not self.test_predicate(pred=pred):
             self._log_info("skipped copy spec '%s' due to predicate (%s)" %
                            (copyspecs, self.get_predicate(pred=pred)))
-            return
+            return None
 
         if sizelimit is None:
             sizelimit = self.get_option("log_size")
@@ -1450,30 +1720,88 @@ class Plugin():
         if isinstance(tags, str):
             tags = [tags]
 
+        def get_filename_tag(fname):
+            """Generate a tag to add for a single file copyspec
+
+            This tag will be set to the filename, minus any extensions
+            except for special extensions like .conf or .log, which will be
+            mangled to _conf or similar.
+            """
+            if fname.startswith(('/proc', '/sys')):
+                return None
+            _fname = fname.split('/')[-1]
+            _fname = _fname.replace('-', '_')
+            if _fname.endswith(('.conf', '.log', '.txt')):
+                return _fname.replace('.', '_')
+            return None
+
         for copyspec in copyspecs:
             if not (copyspec and len(copyspec)):
                 return False
 
-            if self.use_sysroot():
-                copyspec = self.path_join(copyspec)
+            if not container:
+                if self.use_sysroot():
+                    copyspec = self.path_join(copyspec)
+                files = self._expand_copy_spec(copyspec)
+                if len(files) == 0:
+                    continue
+            else:
+                files = [copyspec]
 
-            files = self._expand_copy_spec(copyspec)
+            _spec_tags = []
+            if len(files) == 1:
+                _spec = get_filename_tag(files[0])
+                if _spec:
+                    _spec_tags.append(_spec)
+                _spec_tags.extend(self.get_tags_for_file(files[0]))
 
-            if len(files) == 0:
+            _spec_tags.extend(tags)
+            _spec_tags = list(set(_spec_tags))
+
+            if container:
+                if isinstance(container, str):
+                    container = [container]
+                for con in container:
+                    if not self.container_exists(con):
+                        continue
+                    _tail = False
+                    if sizelimit:
+                        # to get just the size, stat requires a literal '%s'
+                        # which conflicts with python string formatting
+                        cmd = "stat -c %s " + copyspec
+                        ret = self.exec_cmd(cmd, container=con)
+                        if ret['status'] == 0:
+                            try:
+                                consize = int(ret['output'])
+                                if consize > sizelimit:
+                                    _tail = True
+                            except ValueError:
+                                self._log_info(
+                                    "unable to determine size of '%s' in "
+                                    "container '%s'. Skipping collection."
+                                    % (copyspec, con)
+                                )
+                                continue
+                        else:
+                            self._log_debug(
+                                "stat of '%s' in container '%s' failed, "
+                                "skipping collection: %s"
+                                % (copyspec, con, ret['output'])
+                            )
+                            continue
+                    self.container_copy_paths.append(
+                        (con, copyspec, sizelimit, _tail, _spec_tags)
+                    )
+                    self._log_info(
+                        "added collection of '%s' from container '%s'"
+                        % (copyspec, con)
+                    )
+                # break out of the normal flow here as container file
+                # copies are done via command execution, not raw cp/mv
+                # operations
                 continue
 
-            def get_filename_tag(fname):
-                """Generate a tag to add for a single file copyspec
-
-                This tag will be set to the filename, minus any extensions
-                except '.conf' which will be converted to '_conf'
-                """
-                fname = fname.replace('-', '_')
-                if fname.endswith('.conf'):
-                    return fname.replace('.', '_')
-                return fname.split('.')[0]
-
-            # Files hould be sorted in most-recently-modified order, so that
+            # Files should be sorted in most-recently-modified order, so that
             # we collect the newest data first before reaching the limit.
             def getmtime(path):
                 try:
@@ -1494,12 +1822,6 @@ class Plugin():
                    (maxage and (time()-filetime < maxage*3600))):
                     return False
                 return True
-
-            _spec_tags = []
-            if len(files) == 1:
-                _spec_tags = [get_filename_tag(files[0].split('/')[-1])]
-
-            _spec_tags.extend(tags)
 
             if since or maxage:
                 files = list(filter(lambda f: time_filter(f), files))
@@ -1543,24 +1865,21 @@ class Plugin():
                 if sizelimit and current_size > sizelimit:
                     limit_reached = True
 
-                    if tailit and not _file_is_compressed(_file):
-                        self._log_info("collecting tail of '%s' due to size "
-                                       "limit" % _file)
-                        file_name = _file
-                        if file_name[0] == os.sep:
-                            file_name = file_name.lstrip(os.sep)
-                        strfile = (
-                            file_name.replace(os.path.sep, ".") + ".tailed"
+                    if tailit:
+                        if file_is_binary(_file):
+                            self._log_info(
+                                "File '%s' is over size limit and is binary. "
+                                "Skipping collection." % _file
+                            )
+                            continue
+
+                        self._log_info(
+                            "File '%s' is over size limit, will instead tail "
+                            "the file during collection phase." % _file
                         )
                         add_size = sizelimit + file_size - current_size
-                        self.add_string_as_file(tail(_file, add_size), strfile)
-                        rel_path = os.path.relpath('/', os.path.dirname(_file))
-                        link_path = os.path.join(rel_path, 'sos_strings',
-                                                 self.name(), strfile)
-                        self.archive.add_link(link_path, _file)
+                        self._tail_files_list.append((_file, add_size))
                         _manifest_files.append(_file.lstrip('/'))
-                    else:
-                        self._log_info("skipping '%s' over size limit" % _file)
                 else:
                     # size limit not exceeded, copy the file
                     _manifest_files.append(_file.lstrip('/'))
@@ -1569,31 +1888,34 @@ class Plugin():
                     # should collect the whole file and stop
                     limit_reached = (sizelimit and current_size == sizelimit)
 
-            _spec_tags = list(set(_spec_tags))
-            if self.manifest:
-                self.manifest.files.append({
-                    'specification': copyspec,
-                    'files_copied': _manifest_files,
-                    'tags': _spec_tags
-                })
+            if not container:
+                # container collection manifest additions are handled later
+                if self.manifest:
+                    self.manifest.files.append({
+                        'specification': copyspec,
+                        'files_copied': _manifest_files,
+                        'tags': _spec_tags
+                    })
+        return None
 
-    def add_blockdev_cmd(self, cmds, devices='block', timeout=None,
-                         sizelimit=None, chroot=True, runat=None, env=None,
-                         binary=False, prepend_path=None, whitelist=[],
-                         blacklist=[], tags=[], priority=10):
-        """Run a command or list of commands against storage-related devices.
+    def add_device_cmd(self, cmds, devices, timeout=None, sizelimit=None,
+                       chroot=True, runat=None, env=None, binary=False,
+                       prepend_path=None, whitelist=[], blacklist=[], tags=[],
+                       priority=10, subdir=None):
+        """Run a command or list of commands against devices discovered during
+        sos initialization.
 
         Any commands specified by cmd will be iterated over the list of the
         specified devices. Commands passed to this should include a '%(dev)s'
         variable for substitution.
 
-        :param cmds: The command(s) to run against the list of devices
-        :type cmds: ``str`` or a ``list`` of strings
+        :param cmds:    The command(s) to run against the list of devices
+        :type cmds:     ``str`` or a ``list`` of strings
 
-        :param devices: The device paths to run `cmd` against. If set to
-                        `block` or `fibre`, the commands will be run against
-                        the matching list of discovered devices
-        :type devices: ``str`` or a ``list`` of device paths
+        :param devices: The device paths to run `cmd` against. This should be
+                        either a list of devices/device paths or a key in the
+                        devices dict discovered by sos during initialization.
+        :type devices:  ``str`` or a ``list`` of devices or device paths.
 
         :param timeout: Timeout in seconds to allow each `cmd` to run
         :type timeout: ``int``
@@ -1623,59 +1945,62 @@ class Plugin():
         :param blacklist: Do not run `cmds` against devices matching these
                           item(s)
         :type blacklist: ``list`` of ``str``
+
+        :param subdir:  Write the command output to this subdir within the
+                        Plugin directory
+        :type subdir:   ``str``
         """
+
         _dev_tags = []
         if isinstance(tags, str):
             tags = [tags]
-        if devices == 'block':
-            prepend_path = prepend_path or '/dev/'
-            devices = self.devices['block']
-            _dev_tags.append('block')
-        if devices == 'fibre':
-            devices = self.devices['fibre']
-            _dev_tags.append('fibre')
+        if isinstance(devices, str):
+            devices = [devices]
+
+        _devs = recursive_dict_values_by_key(self.devices, devices)
+
+        if whitelist:
+            if isinstance(whitelist, str):
+                whitelist = [whitelist]
+
+            _devs = [d for d in _devs if
+                     any(re.match("(.*)?%s" % wl, d) for wl in whitelist)]
+
+        if blacklist:
+            if isinstance(blacklist, str):
+                blacklist = [blacklist]
+
+            _devs = [d for d in _devs if not
+                     any(re.match("(.*)?%s" % bl, d) for bl in blacklist)]
+
         _dev_tags.extend(tags)
-        self._add_device_cmd(cmds, devices, timeout=timeout,
+        self._add_device_cmd(cmds, _devs, timeout=timeout,
                              sizelimit=sizelimit, chroot=chroot, runat=runat,
                              env=env, binary=binary, prepend_path=prepend_path,
-                             whitelist=whitelist, blacklist=blacklist,
-                             tags=_dev_tags, priority=priority)
+                             tags=_dev_tags, priority=priority, subdir=subdir)
 
     def _add_device_cmd(self, cmds, devices, timeout=None, sizelimit=None,
                         chroot=True, runat=None, env=None, binary=False,
-                        prepend_path=None, whitelist=[], blacklist=[],
-                        tags=[], priority=10):
+                        prepend_path=None, tags=[], priority=10, subdir=None):
         """Run a command against all specified devices on the system.
         """
         if isinstance(cmds, str):
             cmds = [cmds]
         if isinstance(devices, str):
             devices = [devices]
-        if isinstance(whitelist, str):
-            whitelist = [whitelist]
-        if isinstance(blacklist, str):
-            blacklist = [blacklist]
         sizelimit = sizelimit or self.get_option('log_size')
         for cmd in cmds:
             for device in devices:
-                _dev_ok = True
                 _dev_tags = [device]
                 _dev_tags.extend(tags)
-                if whitelist:
-                    if not any(re.match(wl, device) for wl in whitelist):
-                        _dev_ok = False
-                if blacklist:
-                    if any(re.match(blist, device) for blist in blacklist):
-                        _dev_ok = False
-                if not _dev_ok:
-                    continue
                 if prepend_path:
                     device = self.path_join(prepend_path, device)
                 _cmd = cmd % {'dev': device}
                 self._add_cmd_output(cmd=_cmd, timeout=timeout,
                                      sizelimit=sizelimit, chroot=chroot,
                                      runat=runat, env=env, binary=binary,
-                                     tags=_dev_tags, priority=priority)
+                                     tags=_dev_tags, priority=priority,
+                                     subdir=subdir)
 
     def _add_cmd_output(self, **kwargs):
         """Internal helper to add a single command to the collection list."""
@@ -1684,6 +2009,8 @@ class Plugin():
             kwargs['priority'] = 10
         if 'changes' not in kwargs:
             kwargs['changes'] = False
+        if self.get_option('all_logs') or kwargs['sizelimit'] == 0:
+            kwargs['to_file'] = True
         soscmd = SoSCommand(**kwargs)
         self._log_debug("packed command: " + soscmd.__str__())
         for _skip_cmd in self.skip_commands:
@@ -1705,7 +2032,8 @@ class Plugin():
                        chroot=True, runat=None, env=None, binary=False,
                        sizelimit=None, pred=None, subdir=None,
                        changes=False, foreground=False, tags=[],
-                       priority=10, cmd_as_tag=False):
+                       priority=10, cmd_as_tag=False, container=None,
+                       to_file=False):
         """Run a program or a list of programs and collect the output
 
         Output will be limited to `sizelimit`, collecting the last X amount
@@ -1770,6 +2098,14 @@ class Plugin():
         :param cmd_as_tag: Should the command string be automatically formatted
                            to a tag?
         :type cmd_as_tag: ``bool``
+
+        :param container: Run the specified `cmds` inside a container with this
+                          ID or name
+        :type container:  ``str``
+
+        :param to_file: Should command output be written directly to a new
+                        file rather than stored in memory?
+        :type to_file:  ``bool``
         """
         if isinstance(cmds, str):
             cmds = [cmds]
@@ -1780,13 +2116,24 @@ class Plugin():
         if pred is None:
             pred = self.get_predicate(cmd=True)
         for cmd in cmds:
+            container_cmd = None
+            if container:
+                ocmd = cmd
+                container_cmd = (ocmd, container)
+                cmd = self.fmt_container_cmd(container, cmd)
+                if not cmd:
+                    self._log_debug("Skipping command '%s' as the requested "
+                                    "container '%s' does not exist."
+                                    % (ocmd, container))
+                    continue
             self._add_cmd_output(cmd=cmd, suggest_filename=suggest_filename,
                                  root_symlink=root_symlink, timeout=timeout,
                                  stderr=stderr, chroot=chroot, runat=runat,
                                  env=env, binary=binary, sizelimit=sizelimit,
                                  pred=pred, subdir=subdir, tags=tags,
                                  changes=changes, foreground=foreground,
-                                 priority=priority, cmd_as_tag=cmd_as_tag)
+                                 priority=priority, cmd_as_tag=cmd_as_tag,
+                                 to_file=to_file, container_cmd=container_cmd)
 
     def add_cmd_tags(self, tagdict):
         """Retroactively add tags to any commands that have been run by this
@@ -1837,7 +2184,7 @@ class Plugin():
         if name:
             cmd_output_path = os.path.join(cmd_output_path, name)
         if make:
-            os.makedirs(cmd_output_path)
+            os.makedirs(cmd_output_path, exist_ok=True)
 
         return cmd_output_path
 
@@ -1921,21 +2268,16 @@ class Plugin():
 
         :param plug_dir: Should the string be saved under the plugin's dir in
                          sos_commands/? If false, save to sos_strings/
-        :type plug_dir: ``bool`
+        :type plug_dir: ``bool``
 
         :param tags: A tag or set of tags to add to the manifest entry for this
                      collection
         :type tags: ``str`` or a ``list`` of strings
         """
 
-        # Generate summary string for logging
-        summary = content.splitlines()[0] if content else ''
-        if not isinstance(summary, str):
-            summary = content.decode('utf8', 'ignore')
-
         if not self.test_predicate(cmd=False, pred=pred):
-            self._log_info("skipped string ...'%s' due to predicate (%s)" %
-                           (summary, self.get_predicate(pred=pred)))
+            self._log_info("skipped string due to predicate (%s)" %
+                           (self.get_predicate(pred=pred)))
             return
 
         sos_dir = 'sos_commands' if plug_dir else 'sos_strings'
@@ -1945,14 +2287,15 @@ class Plugin():
             tags = [tags]
 
         self.copy_strings.append((content, filename, tags))
-        self._log_debug("added string ...'%s' as '%s'" % (summary, filename))
+        self._log_debug("added string as '%s'" % filename)
 
     def _collect_cmd_output(self, cmd, suggest_filename=None,
                             root_symlink=False, timeout=None,
                             stderr=True, chroot=True, runat=None, env=None,
                             binary=False, sizelimit=None, subdir=None,
                             changes=False, foreground=False, tags=[],
-                            priority=10, cmd_as_tag=False):
+                            priority=10, cmd_as_tag=False, to_file=False,
+                            container_cmd=False):
         """Execute a command and save the output to a file for inclusion in the
         report.
 
@@ -1974,15 +2317,19 @@ class Plugin():
             :param subdir:              Subdir in plugin directory to save to
             :param changes:             Does this cmd potentially make a change
                                         on the system?
+            :param foreground:          Run the `cmd` in the foreground with a
+                                        TTY
             :param tags:                Add tags in the archive manifest
             :param cmd_as_tag:          Format command string to tag
+            :param to_file:             Write output directly to file instead
+                                        of saving in memory
 
         :returns:       dict containing status, output, and filename in the
                         archive for the executed cmd
 
         """
         if self._timeout_hit:
-            return
+            return None
 
         if timeout is None:
             timeout = self.cmdtimeout
@@ -1992,7 +2339,6 @@ class Plugin():
             tags = [tags]
 
         _tags.extend(tags)
-        _tags.append(cmd.split(' ')[0])
         _tags.extend(self.get_tags_for_cmd(cmd))
 
         if cmd_as_tag:
@@ -2000,32 +2346,53 @@ class Plugin():
 
         _tags = list(set(_tags))
 
+        _env = self._get_cmd_environment(env)
+
         if chroot or self.commons['cmdlineopts'].chroot == 'always':
             root = self.sysroot
         else:
             root = None
 
+        if suggest_filename:
+            outfn = self._make_command_filename(suggest_filename, subdir)
+        else:
+            outfn = self._make_command_filename(cmd, subdir)
+
+        outfn_strip = outfn[len(self.commons['cmddir'])+1:]
+
+        if to_file:
+            self._log_debug("collecting '%s' output directly to disk"
+                            % cmd)
+            self.archive.check_path(outfn, P_FILE)
+            out_file = os.path.join(self.archive.get_archive_path(), outfn)
+        else:
+            out_file = False
+
         start = time()
 
         result = sos_get_command_output(
             cmd, timeout=timeout, stderr=stderr, chroot=root,
-            chdir=runat, env=env, binary=binary, sizelimit=sizelimit,
-            poller=self.check_timeout, foreground=foreground
+            chdir=runat, env=_env, binary=binary, sizelimit=sizelimit,
+            poller=self.check_timeout, foreground=foreground,
+            to_file=out_file
         )
 
         end = time()
         run_time = end - start
 
         if result['status'] == 124:
-            self._log_warn(
-                "command '%s' timed out after %ds" % (cmd, timeout)
-            )
+            warn = "command '%s' timed out after %ds" % (cmd, timeout)
+            self._log_warn(warn)
+            if to_file:
+                msg = (" - output up until the timeout may be available at "
+                       "%s" % outfn)
+                self._log_debug("%s%s" % (warn, msg))
 
         manifest_cmd = {
             'command': cmd.split(' ')[0],
             'parameters': cmd.split(' ')[1:],
             'exec': cmd,
-            'filepath': None,
+            'filepath': outfn if to_file else None,
             'truncated': result['truncated'],
             'return_code': result['status'],
             'priority': priority,
@@ -2046,7 +2413,7 @@ class Plugin():
                     result = sos_get_command_output(
                         cmd, timeout=timeout, chroot=False, chdir=runat,
                         env=env, binary=binary, sizelimit=sizelimit,
-                        poller=self.check_timeout
+                        poller=self.check_timeout, to_file=out_file
                     )
                     run_time = time() - start
             self._log_debug("could not run '%s': command not found" % cmd)
@@ -2063,22 +2430,15 @@ class Plugin():
         if result['truncated']:
             self._log_info("collected output of '%s' was truncated"
                            % cmd.split()[0])
-
-        if suggest_filename:
-            outfn = self._make_command_filename(suggest_filename, subdir)
-        else:
-            outfn = self._make_command_filename(cmd, subdir)
-
-        outfn_strip = outfn[len(self.commons['cmddir'])+1:]
-
-        if result['truncated']:
             linkfn = outfn
             outfn = outfn.replace('sos_commands', 'sos_strings') + '.tailed'
 
-        if binary:
-            self.archive.add_binary(result['output'], outfn)
-        else:
-            self.archive.add_string(result['output'], outfn)
+        if not to_file:
+            if binary:
+                self.archive.add_binary(result['output'], outfn)
+            else:
+                self.archive.add_string(result['output'], outfn)
+
         if result['truncated']:
             # we need to manually build the relative path from the paths that
             # exist within the build dir to properly drop these symlinks
@@ -2098,17 +2458,22 @@ class Plugin():
             os.path.join(self.archive.get_archive_path(), outfn) if outfn else
             ''
         )
+
         if self.manifest:
             manifest_cmd['filepath'] = outfn
             manifest_cmd['run_time'] = run_time
             self.manifest.commands.append(manifest_cmd)
+            if container_cmd:
+                self._add_container_cmd_to_manifest(manifest_cmd.copy(),
+                                                    container_cmd)
         return result
 
     def collect_cmd_output(self, cmd, suggest_filename=None,
                            root_symlink=False, timeout=None,
                            stderr=True, chroot=True, runat=None, env=None,
                            binary=False, sizelimit=None, pred=None,
-                           changes=False, subdir=None, tags=[]):
+                           changes=False, foreground=False, subdir=None,
+                           tags=[]):
         """Execute a command and save the output to a file for inclusion in the
         report, then return the results for further use by the plugin
 
@@ -2151,6 +2516,9 @@ class Plugin():
                                     on the system?
         :type changes: ``bool``
 
+        :param foreground:          Run the `cmd` in the foreground with a TTY
+        :type foreground: ``bool``
+
         :param tags:                Add tags in the archive manifest
         :type tags: ``str`` or a ``list`` of strings
 
@@ -2169,8 +2537,8 @@ class Plugin():
         return self._collect_cmd_output(
             cmd, suggest_filename=suggest_filename, root_symlink=root_symlink,
             timeout=timeout, stderr=stderr, chroot=chroot, runat=runat,
-            env=env, binary=binary, sizelimit=sizelimit, subdir=subdir,
-            tags=tags
+            env=env, binary=binary, sizelimit=sizelimit, foreground=foreground,
+            subdir=subdir, tags=tags
         )
 
     def exec_cmd(self, cmd, timeout=None, stderr=True, chroot=True,
@@ -2232,6 +2600,8 @@ class Plugin():
         else:
             root = None
 
+        _env = self._get_cmd_environment(env)
+
         if container:
             if self._get_container_runtime() is None:
                 self._log_info("Cannot run cmd '%s' in container %s: no "
@@ -2244,8 +2614,65 @@ class Plugin():
                                "container is running." % (cmd, container))
 
         return sos_get_command_output(cmd, timeout=timeout, chroot=root,
-                                      chdir=runat, binary=binary, env=env,
+                                      chdir=runat, binary=binary, env=_env,
                                       foreground=foreground, stderr=stderr)
+
+    def _add_container_file_to_manifest(self, container, path, arcpath, tags):
+        """Adds a file collection to the manifest for a particular container
+        and file path.
+
+        :param container:   The name of the container
+        :type container:    ``str``
+
+        :param path:        The filename from the container filesystem
+        :type path:         ``str``
+
+        :param arcpath:     Where in the archive the file is written to
+        :type arcpath:      ``str``
+
+        :param tags:        Metadata tags for this collection
+        :type tags:         ``str`` or ``list`` of strings
+        """
+        if container not in self.manifest.containers:
+            self.manifest.containers[container] = {'files': [], 'commands': []}
+        self.manifest.containers[container]['files'].append({
+            'specification': path,
+            'files_copied': arcpath,
+            'tags': tags
+        })
+
+    def _add_container_cmd_to_manifest(self, manifest, contup):
+        """Adds a command collection to the manifest for a particular container
+        and creates a symlink to that collection from the relevant
+        sos_containers/ location
+
+        :param manifest:    The manifest entry for the command
+        :type manifest:     ``dict``
+
+        :param contup:      A tuple of (original_cmd, container_name)
+        :type contup:       ``tuple``
+        """
+
+        cmd, container = contup
+        if container not in self.manifest.containers:
+            self.manifest.containers[container] = {'files': [], 'commands': []}
+        manifest['exec'] = cmd
+        manifest['command'] = cmd.split(' ')[0]
+        manifest['parameters'] = cmd.split(' ')[1:]
+
+        _cdir = "sos_containers/%s/sos_commands/%s" % (container, self.name())
+        _outloc = "../../../../%s" % manifest['filepath']
+        cmdfn = self._mangle_command(cmd)
+        conlnk = "%s/%s" % (_cdir, cmdfn)
+
+        # If check_path return None, it means that the sym link already exits,
+        # so to avoid Error 17, trying to recreate, we will skip creation and
+        # trust on the existing sym link (e.g. duplicate command)
+        if self.archive.check_path(conlnk, P_LINK):
+            os.symlink(_outloc, self.archive.dest_path(conlnk))
+
+        manifest['filepath'] = conlnk
+        self.manifest.containers[container]['commands'].append(manifest)
 
     def _get_container_runtime(self, runtime=None):
         """Based on policy and request by the plugin, return a usable
@@ -2264,7 +2691,7 @@ class Plugin():
         """If a container runtime is present, check to see if a container with
         a given name is currently running
 
-        :param name:    The name of the container to check presence of
+        :param name:    The name or ID of the container to check presence of
         :type name: ``str``
 
         :returns: ``True`` if `name` exists, else ``False``
@@ -2272,8 +2699,8 @@ class Plugin():
         """
         _runtime = self._get_container_runtime()
         if _runtime is not None:
-            con = _runtime.get_container_by_name(name)
-            return con is not None
+            return (_runtime.container_exists(name) or
+                    _runtime.get_container_by_name(name) is not None)
         return False
 
     def get_all_containers_by_regex(self, regex, get_all=False):
@@ -2379,7 +2806,7 @@ class Plugin():
 
         :param containers:   The name of the container to retrieve logs from,
                              may be a single name or a regex
-        :type containers:    ``str`` or ``list` of strs
+        :type containers:    ``str`` or ``list`` of strs
 
         :param get_all:     Should non-running containers also be queried?
                             Default: False
@@ -2418,7 +2845,7 @@ class Plugin():
         if self.container_exists(container):
             _runtime = self._get_container_runtime()
             return _runtime.fmt_container_cmd(container, cmd, quotecmd)
-        return cmd
+        return ''
 
     def is_module_loaded(self, module_name):
         """Determine whether specified module is loaded or not
@@ -2456,7 +2883,7 @@ class Plugin():
         :param services: Service name(s) to collect statuses for
         :type services: ``str`` or a ``list`` of strings
 
-        :param kwargs:   Optional arguments to pass to _add_cmd_output
+        :param kwargs:   Optional arguments to pass to add_cmd_output
                          (timeout, predicate, suggest_filename,..)
 
         """
@@ -2471,7 +2898,7 @@ class Plugin():
             return
 
         for service in services:
-            self._add_cmd_output(cmd="%s %s" % (query, service), **kwargs)
+            self.add_cmd_output("%s %s" % (query, service), **kwargs)
 
     def add_journal(self, units=None, boot=None, since=None, until=None,
                     lines=None, allfields=False, output=None,
@@ -2525,10 +2952,11 @@ class Plugin():
         identifier_opt = " --identifier %s"
         catalog_opt = " --catalog"
 
-        journal_size = 100
-        all_logs = self.get_option("all_logs")
-        log_size = sizelimit or self.get_option("log_size")
-        log_size = max(log_size, journal_size) if not all_logs else 0
+        if sizelimit == 0 or self.get_option("all_logs"):
+            # allow for specific sizelimit overrides in plugins
+            log_size = 0
+        else:
+            log_size = sizelimit or self.get_option('journal_size')
 
         if isinstance(units, str):
             units = [units]
@@ -2621,10 +3049,52 @@ class Plugin():
         return list(set(expanded))
 
     def _collect_copy_specs(self):
-        for path in self.copy_paths:
+        for path in sorted(self.copy_paths, reverse=True):
             self._log_info("collecting path '%s'" % path)
             self._do_copy_path(path)
         self.generate_copyspec_tags()
+
+    def _collect_container_copy_specs(self):
+        """Copy any requested files from containers here. This is done
+        separately from normal file collection as this requires the use of
+        a container runtime.
+
+        This method will iterate over self.container_copy_paths which is a set
+        of 5-tuples as (container, path, sizelimit, stdout, tags).
+        """
+        if not self.container_copy_paths:
+            return
+        rt = self._get_container_runtime()
+        if not rt:
+            self._log_info("Cannot collect container based files - no runtime "
+                           "is present/active.")
+            return
+        if not rt.check_can_copy():
+            self._log_info("Loaded runtime '%s' does not support copying "
+                           "files from containers. Skipping collections.")
+            return
+        for contup in self.container_copy_paths:
+            con, path, sizelimit, tailit, tags = contup
+            self._log_info("collecting '%s' from container '%s'" % (path, con))
+
+            arcdest = "sos_containers/%s/%s" % (con, path.lstrip('/'))
+            self.archive.check_path(arcdest, P_FILE)
+            dest = self.archive.dest_path(arcdest)
+
+            cpcmd = rt.get_copy_command(
+                con, path, dest, sizelimit=sizelimit if tailit else None
+            )
+            cpret = self.exec_cmd(cpcmd, timeout=10)
+
+            if cpret['status'] == 0:
+                if tailit:
+                    # current runtimes convert files sent to stdout to tar
+                    # archives, with no way to control that
+                    self.archive.add_string(cpret['output'], arcdest)
+                self._add_container_file_to_manifest(con, path, arcdest, tags)
+            else:
+                self._log_info("error copying '%s' from container '%s': %s"
+                               % (path, con, cpret['output']))
 
     def _collect_cmds(self):
         self.collect_cmds.sort(key=lambda x: x.priority)
@@ -2633,17 +3103,26 @@ class Plugin():
             self._log_info("collecting output of '%s'" % soscmd.cmd)
             self._collect_cmd_output(**soscmd.__dict__)
 
+    def _collect_tailed_files(self):
+        for _file, _size in self._tail_files_list:
+            self._log_info(f"collecting tail of '{_file}' due to size limit")
+            file_name = _file
+            if file_name[0] == os.sep:
+                file_name = file_name.lstrip(os.sep)
+            strfile = (
+                file_name.replace(os.path.sep, ".") + ".tailed"
+            )
+            self.add_string_as_file(tail(_file, _size), strfile)
+            rel_path = os.path.relpath('/', os.path.dirname(_file))
+            link_path = os.path.join(rel_path, 'sos_strings',
+                                     self.name(), strfile)
+            self.archive.add_link(link_path, _file)
+
     def _collect_strings(self):
         for string, file_name, tags in self.copy_strings:
             if self._timeout_hit:
                 return
-            content = ''
-            if string:
-                content = string.splitlines()[0]
-                if not isinstance(content, str):
-                    content = content.decode('utf8', 'ignore')
-            self._log_info("collecting string ...'%s' as '%s'"
-                           % (content, file_name))
+            self._log_info("collecting string as '%s'" % file_name)
             try:
                 self.archive.add_string(string, file_name)
                 _name = file_name.split('/')[-1].replace('.', '_')
@@ -2655,12 +3134,79 @@ class Plugin():
                 self._log_debug("could not add string '%s': %s"
                                 % (file_name, e))
 
+    def _collect_manual(self):
+        """Kick off manual collections performed by the plugin. These manual
+        collections are anything the plugin collects outside of existing
+        files and/or command output. Anything the plugin manually compiles or
+        constructs for data that is included in the final archive.
+
+        Plugins will need to define these collections by overriding the
+        ``collect()`` method, similar to how plugins define their own
+        ``setup()`` methods.
+        """
+        try:
+            self.collect()
+        except Exception as err:
+            self._log_error(f"Error during plugin collections: {err}")
+
     def collect(self):
+        """If a plugin needs to manually compile some data for a collection,
+        that should be specified here by overriding this method.
+
+        These collections are run last during a plugin's execution, and as such
+        are more likely to be interrupted by timeouts than file or command
+        output collections.
+        """
+        pass
+
+    @contextlib.contextmanager
+    def collection_file(self, fname, subdir=None, tags=[]):
+        """Handles creating and managing files within a plugin's subdirectory
+        within the archive, and is intended to be used to save manually
+        compiled data generated during a plugin's ``_collect_manual()`` step
+        of the collection phase.
+
+        Plugins should call this method using a ``with`` context manager.
+
+        :param fname:       The name of the file within the plugin directory
+        :type fname:        ``str``
+
+        :param subdir:      If needed, specify a subdir to write the file to
+        :type subdir:       ``str``
+
+        :param tags:        Tags to be added to this file in the manifest
+        :type tags:         ``str`` or ``list`` of ``str``
+        """
+        try:
+            start = time()
+            _pfname = self._make_command_filename(fname, subdir=subdir)
+            self.archive.check_path(_pfname, P_FILE)
+            _name = self.archive.dest_path(_pfname)
+            with open(_name, 'w') as _file:
+                self._log_debug(f"manual collection file opened: {_name}")
+                yield _file
+            end = time()
+            run = end - start
+            self._log_info(f"manual collection '{fname}' finished in {run}")
+            if isinstance(tags, str):
+                tags = [tags]
+            self.manifest.collections.append({
+                'name': fname,
+                'filepath': _pfname,
+                'tags': tags
+            })
+        except Exception as err:
+            self._log_info(f"Error with collection file '{fname}': {err}")
+
+    def collect_plugin(self):
         """Collect the data for a plugin."""
         start = time()
         self._collect_copy_specs()
-        self._collect_cmds()
+        self._collect_container_copy_specs()
+        self._collect_tailed_files()
         self._collect_strings()
+        self._collect_cmds()
+        self._collect_manual()
         fields = (self.name(), time() - start)
         self._log_debug("collected plugin '%s' in %s" % fields)
 
@@ -2749,7 +3295,7 @@ class Plugin():
 
         return ((any(self.path_exists(fname) for fname in files) or
                 any(self.is_installed(pkg) for pkg in packages) or
-                any(is_executable(cmd) for cmd in commands) or
+                any(is_executable(cmd, self.sysroot) for cmd in commands) or
                 any(self.is_module_loaded(mod) for mod in self.kernel_mods) or
                 any(self.is_service(svc) for svc in services) or
                 any(self.container_exists(cntr) for cntr in containers)) and
@@ -2785,6 +3331,9 @@ class Plugin():
             if self.is_service(service):
                 self.add_service_status(service)
                 self.add_journal(service)
+        for kmod in self.kernel_mods:
+            if self.is_module_loaded(kmod):
+                self.add_cmd_output(f"modinfo {kmod}")
 
     def setup(self):
         """Collect the list of files declared by the plugin. This method
@@ -2817,7 +3366,7 @@ class Plugin():
         :returns:           True if the path exists in sysroot, else False
         :rtype:             ``bool``
         """
-        return path_exists(path, self.commons['cmdlineopts'].sysroot)
+        return path_exists(path, self.sysroot)
 
     def path_isdir(self, path):
         """Helper to call the sos.utilities wrapper that allows the
@@ -2830,7 +3379,7 @@ class Plugin():
         :returns:           True if the path is a dir, else False
         :rtype:             ``bool``
         """
-        return path_isdir(path, self.commons['cmdlineopts'].sysroot)
+        return path_isdir(path, self.sysroot)
 
     def path_isfile(self, path):
         """Helper to call the sos.utilities wrapper that allows the
@@ -2843,7 +3392,7 @@ class Plugin():
         :returns:           True if the path is a file, else False
         :rtype:             ``bool``
         """
-        return path_isfile(path, self.commons['cmdlineopts'].sysroot)
+        return path_isfile(path, self.sysroot)
 
     def path_islink(self, path):
         """Helper to call the sos.utilities wrapper that allows the
@@ -2856,7 +3405,7 @@ class Plugin():
         :returns:           True if the path is a link, else False
         :rtype:             ``bool``
         """
-        return path_islink(path, self.commons['cmdlineopts'].sysroot)
+        return path_islink(path, self.sysroot)
 
     def listdir(self, path):
         """Helper to call the sos.utilities wrapper that allows the
@@ -2869,7 +3418,7 @@ class Plugin():
         :returns:           Contents of path, if it is a directory
         :rtype:             ``list``
         """
-        return listdir(path, self.commons['cmdlineopts'].sysroot)
+        return listdir(path, self.sysroot)
 
     def path_join(self, path, *p):
         """Helper to call the sos.utilities wrapper that allows the
@@ -2904,10 +3453,10 @@ class Plugin():
         try:
             cmd_line_paths = glob.glob(cmd_line_glob)
             for path in cmd_line_paths:
-                f = open(self.path_join(path), 'r')
-                cmd_line = f.read().strip()
-                if process in cmd_line:
-                    status = True
+                with open(self.path_join(path), 'r') as pfile:
+                    cmd_line = pfile.read().strip()
+                    if process in cmd_line:
+                        status = True
         except IOError:
             return False
         return status
@@ -2970,8 +3519,52 @@ class Plugin():
         return out_ns
 
 
-class RedHatPlugin(object):
+class PluginDistroTag():
+    """The base tagging class for distro-specific classes used to signify that
+    a Plugin is written for that distro.
+
+    Use IndependentPlugin for plugins that are distribution agnostic
+    """
+    pass
+
+
+class RedHatPlugin(PluginDistroTag):
     """Tagging class for Red Hat's Linux distributions"""
+    pass
+
+
+class UbuntuPlugin(PluginDistroTag):
+    """Tagging class for Ubuntu Linux"""
+    pass
+
+
+class DebianPlugin(PluginDistroTag):
+    """Tagging class for Debian Linux"""
+    pass
+
+
+class SuSEPlugin(PluginDistroTag):
+    """Tagging class for SuSE Linux distributions"""
+    pass
+
+
+class OpenEulerPlugin(PluginDistroTag):
+    """Tagging class for openEuler linux distributions"""
+    pass
+
+
+class CosPlugin(PluginDistroTag):
+    """Tagging class for Container-Optimized OS"""
+    pass
+
+
+class IndependentPlugin(PluginDistroTag):
+    """Tagging class for plugins that can run on any platform"""
+    pass
+
+
+class ExperimentalPlugin(PluginDistroTag):
+    """Tagging class that indicates that this plugin is experimental"""
     pass
 
 
@@ -2983,20 +3576,6 @@ class SCLPlugin(RedHatPlugin):
     to match these against all found SCLs on the system. SCLs that do match
     class.files or class.packages are then accessible via self.scls_matched
     when the plugin is invoked.
-
-    Additionally, this plugin class provides "add_cmd_output_scl" (run
-    a command in context of given SCL), and "add_copy_spec_scl" and
-    "add_copy_spec_limit_scl" (copy package from file system of given SCL).
-
-    For example, you can implement a plugin that will list all global npm
-    packages in every SCL that contains "npm" package:
-
-    class SCLNpmPlugin(Plugin, SCLPlugin):
-        packages = ("%(scl_name)s-npm",)
-
-        def setup(self):
-            for scl in self.scls_matched:
-                self.add_cmd_output_scl(scl, "npm ls -g --json")
     """
 
     @property
@@ -3014,19 +3593,6 @@ class SCLPlugin(RedHatPlugin):
         """
         scl_cmd = "scl enable %s \"%s\"" % (scl, cmd)
         return scl_cmd
-
-    def add_cmd_output_scl(self, scl, cmds, **kwargs):
-        """Same as add_cmd_output, except that it wraps command in
-        "scl enable" call and sets proper PATH.
-        """
-        if scl not in self.scls_matched:
-            return
-        if isinstance(cmds, str):
-            cmds = [cmds]
-        scl_cmds = []
-        for cmd in cmds:
-            scl_cmds.append(self.convert_cmd_scl(scl, cmd))
-        self.add_cmd_output(scl_cmds, **kwargs)
 
     # config files for Software Collections are under /etc/${prefix}/${scl} and
     # var files are under /var/${prefix}/${scl} where the ${prefix} is distro
@@ -3053,36 +3619,6 @@ class SCLPlugin(RedHatPlugin):
         for copyspec in copyspecs:
             scl_copyspecs.append(self.convert_copyspec_scl(scl, copyspec))
         self.add_copy_spec(scl_copyspecs)
-
-
-class UbuntuPlugin(object):
-    """Tagging class for Ubuntu Linux"""
-    pass
-
-
-class DebianPlugin(object):
-    """Tagging class for Debian Linux"""
-    pass
-
-
-class SuSEPlugin(object):
-    """Tagging class for SuSE Linux distributions"""
-    pass
-
-
-class CosPlugin(object):
-    """Tagging class for Container-Optimized OS"""
-    pass
-
-
-class IndependentPlugin(object):
-    """Tagging class for plugins that can run on any platform"""
-    pass
-
-
-class ExperimentalPlugin(object):
-    """Tagging class that indicates that this plugin is experimental"""
-    pass
 
 
 def import_plugin(name, superclasses=None):

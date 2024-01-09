@@ -7,10 +7,25 @@
 # See the LICENSE file in the source distribution for further information.
 
 from sos.report.plugins import Plugin, IndependentPlugin, PluginOpt
+from sos.policies.distros.redhat import RedHatPolicy
 import glob
 
 
 class Kernel(Plugin, IndependentPlugin):
+    """The Kernel plugin is aimed at collecting general information about
+    the locally running kernel. This information should be distribution-neutral
+    using commands and filesystem collections that are ubiquitous across
+    distributions.
+
+    Debugging information from /sys/kernel/debug is collected by default,
+    however care is taken so that these collections avoid areas like
+    /sys/kernel/debug/tracing/trace_pipe which would otherwise cause the
+    sos collection attempt to appear to 'hang'.
+
+    The 'trace' option will enable the collection of the
+    /sys/kernel/debug/tracing/trace file specfically, but will not change the
+    behavior stated above otherwise.
+    """
 
     short_desc = 'Linux kernel'
 
@@ -28,9 +43,14 @@ class Kernel(Plugin, IndependentPlugin):
     ]
 
     def setup(self):
+        # RedHat distributions can deliver kernel in RPM named either 'kernel'
+        # or 'kernel-redhat', so we must verify both
+        if isinstance(self.policy, RedHatPolicy):
+            self.verify_packages = ('kernel$', 'kernel-redhat$')
+
         # compat
-        self.add_cmd_output("uname -a", root_symlink="uname")
-        self.add_cmd_output("lsmod", root_symlink="lsmod")
+        self.add_cmd_output("uname -a", root_symlink="uname", tags="uname")
+        self.add_cmd_output("lsmod", root_symlink="lsmod", tags="lsmod")
         self.add_cmd_output("ls -lt /sys/kernel/slab")
 
         try:
@@ -56,9 +76,9 @@ class Kernel(Plugin, IndependentPlugin):
 
         self.add_cmd_output([
             "dmesg",
-            "sysctl -a",
             "dkms status"
         ], cmd_as_tag=True)
+        self.add_cmd_output("sysctl -a", tags="sysctl")
 
         clocksource_path = "/sys/devices/system/clocksource/clocksource0/"
 
@@ -97,6 +117,9 @@ class Kernel(Plugin, IndependentPlugin):
             "/etc/modules.conf",
             "/etc/modprobe.conf",
             "/etc/modprobe.d",
+            "/lib/modprobe.d",
+            "/run/modprobe.d",
+            "/usr/local/lib/modprobe.d",
             "/etc/sysctl.conf",
             "/etc/sysctl.d",
             "/lib/sysctl.d",
@@ -108,6 +131,7 @@ class Kernel(Plugin, IndependentPlugin):
             "/proc/misc",
             "/var/log/dmesg",
             "/sys/fs/pstore",
+            "/var/lib/systemd/pstore",
             "/sys/kernel/debug/dynamic_debug/control",
             "/sys/kernel/debug/extfrag/unusable_index",
             "/sys/kernel/debug/extfrag/extfrag_index",

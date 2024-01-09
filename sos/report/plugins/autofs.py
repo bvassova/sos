@@ -40,9 +40,11 @@ class Autofs(Plugin):
                                   *self.files)
         for i in debugout:
             return i[1]
+        return None
 
     def setup(self):
         self.add_copy_spec("/etc/auto*")
+        self.add_file_tags({"/etc/autofs.conf": "autofs_conf"})
         self.add_service_status("autofs")
         self.add_cmd_output("automount -m")
         if self.checkdebug():
@@ -53,6 +55,25 @@ class Autofs(Plugin):
             "/etc/auto*",
             r"(password=)[^,\s]*",
             r"\1********"
+        )
+        # Hide secrets in the LDAP authentication config
+        #
+        # Example of scrubbing of the secret:
+        #
+        #     secret="abc"
+        #   or
+        #     encoded_secret = 'abc'
+        #
+        # to:
+        #
+        #     secret="********"
+        #   or
+        #     encoded_secret = '********'
+        #
+        self.do_file_sub(
+            "/etc/autofs_ldap_auth.conf",
+            r"(secret[\s]*[=]+[\s]*)(\'|\").*(\'|\")",
+            r"\1\2********\3"
         )
         self.do_cmd_output_sub(
             "automount -m",

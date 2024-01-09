@@ -24,12 +24,29 @@ class Fibrechannel(Plugin, RedHatPlugin):
 
     # vendor specific debug paths
     debug_paths = [
-        '/sys/kernel/debug/qla2*/'
+        '/sys/kernel/debug/qla2*/',
+        '/sys/kernel/debug/fnic/',
     ]
 
     def setup(self):
-        self.add_blockdev_cmd("udevadm info -a %(dev)s", devices='fibre')
+        self.add_device_cmd("udevadm info -a %(dev)s", devices='fibre')
         if self.get_option('debug'):
             self.add_copy_spec(self.debug_paths)
 
+        self.add_cmd_output([
+            "hbacmd listhbas",
+            "hbacmd ServerAttributes"
+        ])
+
+        # collect Hbaattributes and Portattributes of WWN
+        listhbas = self.collect_cmd_output("hbacmd listhbas")
+        if listhbas['status'] == 0:
+            for line in listhbas['output'].splitlines():
+                if 'Port WWN' in line:
+                    dev = line.split()[3]
+                    self.add_cmd_output([
+                        "hbacmd HbaAttributes %s" % dev,
+                        "hbacmd PortAttributes %s" % dev,
+                        "hbacmd GetXcvrData %s" % dev
+                    ])
 # vim: set et ts=4 sw=4 :

@@ -46,16 +46,16 @@ class OpenStackTrove(Plugin):
         protect_keys = [
             "default_password_length", "notifier_queue_password",
             "rabbit_password", "replication_password", "admin_password",
-            "dns_passkey", "transport_url"
+            "dns_passkey", "transport_url", "memcache_secret_key"
         ]
         connection_keys = ["connection"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )
@@ -67,7 +67,8 @@ class DebianTrove(OpenStackTrove, DebianPlugin, UbuntuPlugin):
         'python-trove',
         'trove-common',
         'trove-api',
-        'trove-taskmanager'
+        'trove-taskmanager',
+        'python3-trove',
     )
 
     def setup(self):

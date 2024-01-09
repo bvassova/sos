@@ -85,10 +85,14 @@ class OpenVSwitch(Plugin):
         if ovs_dbdir:
             self.add_copy_spec(self.path_join(ovs_dbdir, 'conf.db'))
 
+        self.add_file_tags({
+            "/var/log/openvswitch/ovs-vswitchd.log":
+                "openvswitch_daemon_log",
+            "/var/log/openvswitch/ovsdb-server.log":
+                "openvswitch_server_log"
+        })
+
         self.add_cmd_output([
-            # The '-t 5' adds an upper bound on how long to wait to connect
-            # to the Open vSwitch server, avoiding hangs when running sos.
-            "ovs-vsctl -t 5 show",
             # List the contents of important runtime directories
             "ls -laZ /run/openvswitch",
             "ls -laZ /dev/hugepages/",
@@ -98,7 +102,10 @@ class OpenVSwitch(Plugin):
             "dpdk_nic_bind --status",
             "dpdk-devbind.py --status",
             "driverctl list-devices",
+            "driverctl -v list-devices",
             "driverctl list-overrides",
+            "driverctl -v list-overrides",
+            "driverctl list-persisted",
             # Capture a list of all bond devices
             "ovs-appctl bond/list",
             # Capture more details from bond devices
@@ -116,15 +123,17 @@ class OpenVSwitch(Plugin):
             "ovs-appctl tnl/ports/show -v",
             # Capture upcall information
             "ovs-appctl upcall/show",
-            # Capture DPDK and other parameters
-            "ovs-vsctl -t 5 get Open_vSwitch . other_config",
             # Capture OVS list
             "ovs-vsctl -t 5 list Open_vSwitch",
             # Capture OVS interface list
             "ovs-vsctl -t 5 list interface",
             # Capture OVS detailed information from all the bridges
             "ovs-vsctl -t 5 list bridge",
+            # Capture OVS datapath list
+            "ovs-vsctl -t 5 list datapath",
             # Capture DPDK queue to pmd mapping
+            "ovs-appctl dpif-netdev/pmd-rxq-show -secs 5",
+            "ovs-appctl dpif-netdev/pmd-rxq-show -secs 30",
             "ovs-appctl dpif-netdev/pmd-rxq-show",
             # Capture DPDK pmd stats
             "ovs-appctl dpif-netdev/pmd-stats-show",
@@ -145,8 +154,23 @@ class OpenVSwitch(Plugin):
             # Capture dpif implementations
             "ovs-appctl dpif-netdev/dpif-impl-get",
             # Capture miniflow extract implementations
-            "ovs-appctl dpif-netdev/miniflow-parser-get"
+            "ovs-appctl dpif-netdev/miniflow-parser-get",
+            # Capture DPDK pmd sleep config
+            "ovs-appctl dpif-netdev/pmd-sleep-show",
+            # Capture additional DPDK info
+            "ovs-appctl dpdk/lcore-list",
+            "ovs-appctl dpdk/log-list",
+            "ovs-appctl dpdk/get-malloc-stats",
+            # Capture dpdk mempool info
+            "ovs-appctl netdev-dpdk/get-mempool-info"
         ])
+        # Capture DPDK and other parameters
+        self.add_cmd_output("ovs-vsctl -t 5 get Open_vSwitch . other_config",
+                            tags="openvswitch_other_config")
+        # The '-t 5' adds an upper bound on how long to wait to connect
+        # to the Open vSwitch server, avoiding hangs when running sos.
+        self.add_cmd_output("ovs-vsctl -t 5 show",
+                            tags="ovs_vsctl_show")
 
         # Gather systemd services logs
         self.add_journal(units="openvswitch")
@@ -229,6 +253,7 @@ class OpenVSwitch(Plugin):
                     "ovs-ofctl queue-get-config %s" % br,
                     "ovs-ofctl queue-stats %s" % br,
                     "ovs-ofctl show %s" % br,
+                    "ovs-ofctl dump-groups %s" % br,
                 ])
 
                 # Flow protocols currently supported
@@ -362,7 +387,7 @@ class OpenVSwitch(Plugin):
 
 class RedHatOpenVSwitch(OpenVSwitch, RedHatPlugin):
 
-    packages = ('openvswitch', 'openvswitch2.*',
+    packages = ('openvswitch', 'openvswitch[2-9].*',
                 'openvswitch-dpdk', 'nuage-openvswitch'
                 '6windgate-fp')
 

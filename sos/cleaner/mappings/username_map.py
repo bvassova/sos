@@ -22,16 +22,11 @@ class SoSUsernameMap(SoSMap):
 
     name_count = 0
 
-    def load_names_from_options(self, opt_names):
-        for name in opt_names:
-            if name not in self.dataset.keys():
-                self.add(name)
-
     def sanitize_item(self, username):
         """Obfuscate a new username not currently found in the map
         """
         ob_name = "obfuscateduser%s" % self.name_count
         self.name_count += 1
         if ob_name in self.dataset.values():
-            return self.sanitize_item(username)
+            return self.sanitize_item(username.lower())
         return ob_name

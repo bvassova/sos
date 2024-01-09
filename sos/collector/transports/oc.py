@@ -18,15 +18,29 @@ from sos.utilities import (is_executable, sos_get_command_output,
 
 
 class OCTransport(RemoteTransport):
-    """This transport leverages the execution of commands via a locally
+    """
+    This transport leverages the execution of commands via a locally
     available and configured ``oc`` binary for OCPv4 environments.
+
+    The location of the oc binary MUST be in the $PATH used by the locally
+    loaded SoS policy. Specifically this means that the binary cannot be in the
+    running user's home directory, such as ~/.local/bin.
 
     OCPv4 clusters generally discourage the use of SSH, so this transport may
     be used to remove our use of SSH in favor of the environment provided
     method of connecting to nodes and executing commands via debug pods.
 
-    Note that this approach will generate multiple debug pods over the course
-    of our execution
+    The debug pod created will be a privileged pod that mounts the host's
+    filesystem internally so that sos report collections reflect the host, and
+    not the container in which it runs.
+
+    This transport will execute within a temporary 'sos-collect-tmp' project
+    created by the OCP cluster profile. The project will be removed at the end
+    of execution.
+
+    In the event of failures due to a misbehaving OCP API or oc binary, it is
+    recommended to fallback to the control_persist transport by manually
+    setting the --transport option.
     """
 
     name = 'oc'
@@ -95,7 +109,8 @@ class OCTransport(RemoteTransport):
                 "containers": [
                     {
                         "name": "sos-collector-tmp",
-                        "image": "registry.redhat.io/rhel8/support-tools",
+                        "image": "registry.redhat.io/rhel8/support-tools"
+                                if not self.opts.image else self.opts.image,
                         "command": [
                             "/bin/bash"
                         ],
@@ -133,6 +148,8 @@ class OCTransport(RemoteTransport):
                         "tty": True
                     }
                 ],
+                "imagePullPolicy":
+                    "Always" if self.opts.force_pull_image else "IfNotPresent",
                 "restartPolicy": "Never",
                 "nodeName": self.address,
                 "hostNetwork": True,
@@ -191,18 +208,19 @@ class OCTransport(RemoteTransport):
         return super(OCTransport, self)._format_cmd_for_exec(cmd)
 
     def run_command(self, cmd, timeout=180, need_root=False, env=None,
-                    get_pty=False):
+                    use_shell=False):
         # debug pod setup is slow, extend all timeouts to account for this
         if timeout:
             timeout += 10
 
-        # since we always execute within a bash shell, force disable get_pty
+        # since we always execute within a bash shell, force disable use_shell
         # to avoid double-quoting
         return super(OCTransport, self).run_command(cmd, timeout, need_root,
-                                                    env, False)
+                                                    env, use_shell=False)
 
     def _disconnect(self):
-        os.unlink(self.pod_tmp_conf)
+        if os.path.exists(self.pod_tmp_conf):
+            os.unlink(self.pod_tmp_conf)
         removed = self.run_oc("delete pod %s" % self.pod_name)
         if "deleted" not in removed['output']:
             self.log_debug("Calling delete on pod '%s' failed: %s"
@@ -216,5 +234,9 @@ class OCTransport(RemoteTransport):
                 % (self.project, self.pod_name))
 
     def _retrieve_file(self, fname, dest):
-        cmd = self.run_oc("cp %s:%s %s" % (self.pod_name, fname, dest))
+        # check if --retries flag is available for given version of oc
+        result = self.run_oc("cp --retries", stderr=True)
+        flags = '' if "unknown flag" in result["output"] else '--retries=5'
+        cmd = self.run_oc("cp %s %s:%s %s"
+                          % (flags, self.pod_name, fname, dest))
         return cmd['status'] == 0

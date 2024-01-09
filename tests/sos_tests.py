@@ -11,9 +11,11 @@ from avocado.core.exceptions import TestSkipError
 from avocado.core.output import LOG_UI
 from avocado import Test
 from avocado.utils import archive, process, distro, software_manager
+from avocado.utils.cpu import get_arch
 from fnmatch import fnmatch
 
 import glob
+import inspect
 import json
 import os
 import pickle
@@ -25,7 +27,7 @@ SOS_TEST_DIR = os.path.dirname(os.path.realpath(__file__))
 SOS_REPO_ROOT = os.path.realpath(os.path.join(SOS_TEST_DIR, '../'))
 SOS_PLUGIN_DIR = os.path.realpath(os.path.join(SOS_REPO_ROOT, 'sos/report/plugins'))
 SOS_TEST_DATA_DIR = os.path.realpath(os.path.join(SOS_TEST_DIR, 'test_data'))
-SOS_BIN = os.path.realpath(os.path.join(SOS_TEST_DIR, '../bin/sos'))
+SOS_TEST_BIN = os.path.realpath(os.path.join(SOS_TEST_DIR, '../bin/sos'))
 
 RH_DIST = ['rhel', 'centos', 'fedora']
 UBUNTU_DIST = ['Ubuntu', 'debian']
@@ -64,11 +66,13 @@ class BaseSoSTest(Test):
     _klass_name = None
     _tmpdir = None
     _exception_expected = False
+    _local_sos_bin = shutil.which('sos') or SOS_TEST_BIN
     sos_cmd = ''
-    sos_timeout = 300
+    sos_timeout = 600
     redhat_only = False
     ubuntu_only = False
     end_of_test_case = False
+    arch = []
 
     @property
     def klass_name(self):
@@ -81,6 +85,10 @@ class BaseSoSTest(Test):
         if not self._tmpdir:
             self._tmpdir = os.getenv('AVOCADO_TESTS_COMMON_TMPDIR') + self.klass_name
         return self._tmpdir
+
+    @property
+    def sos_bin(self):
+        return self._local_sos_bin if self.params.get('TESTLOCAL') == 'true' else SOS_TEST_BIN
 
     def generate_sysinfo(self):
         """Collects some basic information about the system for later reference
@@ -121,7 +129,8 @@ class BaseSoSTest(Test):
         """
         exec_cmd = self._generate_sos_command()
         try:
-            self.cmd_output = process.run(exec_cmd, timeout=self.sos_timeout)
+            self.cmd_output = process.run(exec_cmd, timeout=self.sos_timeout,
+                                          env={'SOS_TEST_LOGS': 'keep'})
         except Exception as err:
             if not hasattr(err, 'result'):
                 # can't inspect the exception raised, just bail out
@@ -220,6 +229,22 @@ class BaseSoSTest(Test):
             if self.local_distro not in UBUNTU_DIST:
                 raise TestSkipError("Not running on a Ubuntu or Debian distro")
 
+    def check_arch_for_enablement(self):
+        """
+        Check if the test case is meant only for a specific architecture, and
+        if it is, that we're also currently running on (one of) those arches.
+
+        This relies on the `arch` class attr, which should be a list. If the
+        list is empty, assume all arches are acceptable. Otherwise, raise a
+        TestSkipError.
+        """
+        sys_arch = get_arch()
+        if not self.arch or sys_arch in self.arch:
+            return True
+        raise TestSkipError(f"Unsupported architecture {sys_arch} for test "
+                            f"(supports: {self.arch})")
+
+
     def setUp(self):
         """Setup the tmpdir and any needed mocking for the test, then execute
         the defined sos command. Ensure that we only run the sos command once
@@ -227,6 +252,7 @@ class BaseSoSTest(Test):
         """
         self.local_distro = distro.detect().name
         self.check_distro_for_enablement()
+        self.check_arch_for_enablement()
         # check to prevent multiple setUp() runs
         if not os.path.isdir(self.tmpdir):
             # setup our class-shared tmpdir
@@ -268,10 +294,17 @@ class BaseSoSTest(Test):
         for each `test_*` method defined within it.
         """
         if self.end_of_test_case:
+            self.post_test_tear_down()
             # remove the extracted directory only if we have the tarball
             if self.archive and os.path.exists(self.archive):
                 if os.path.exists(self.archive_path):
                     shutil.rmtree(self.archive_path)
+
+    def post_test_tear_down(self):
+        """Called at the end of a test run to ensure that any needed per-test
+        cleanup can be done.
+        """
+        pass
 
     def setup_mocking(self):
         """Since we need to use setUp() in our overrides of avocado.Test,
@@ -336,7 +369,7 @@ class BaseSoSReportTest(BaseSoSTest):
                 self._manifest = json.loads(content)
             except Exception:
                 self._manifest = ''
-                self.warn('Could not load manifest for test')
+                self.warning('Could not load manifest for test')
         return self._manifest
 
     @property
@@ -357,11 +390,16 @@ class BaseSoSReportTest(BaseSoSTest):
             raise
         return _archive
 
-    def grep_for_content(self, search):
+    def grep_for_content(self, search, regexp=False):
         """Call out to grep for finding a specific string 'search' in any place
         in the archive
+
+        :param search: string to search
+        :param regexp: use regular expression search (default False
+                       means "grep -F")
         """
-        cmd = "grep -ril '%s' %s" % (search, self.archive_path)
+        fixed_opt = "" if regexp else "F"
+        cmd = "grep -ril%s '%s' %s" % (fixed_opt, search, self.archive_path)
         try:
             out = process.run(cmd)
             rc = out.exit_status
@@ -409,7 +447,7 @@ class BaseSoSReportTest(BaseSoSTest):
         return os.path.join(self.tmpdir, "sosreport-%s" % self.__class__.__name__)
         
     def _generate_sos_command(self):
-        return "%s %s -v --batch --tmp-dir %s %s" % (SOS_BIN, self.sos_component, self.tmpdir, self.sos_cmd)
+        return "%s %s -v --batch --tmp-dir %s %s" % (self.sos_bin, self.sos_component, self.tmpdir, self.sos_cmd)
 
     def _execute_sos_cmd(self):
         super(BaseSoSReportTest, self)._execute_sos_cmd()
@@ -778,7 +816,7 @@ class StageTwoReportTest(BaseSoSReportTest):
         for plug in self.install_plugins:
             if not plug.endswith('.py'):
                 plug += '.py'
-            fake_plug = os.path.join(SOS_TEST_DATA_DIR, 'fake_plugins', plug)
+            fake_plug = os.path.join(os.path.dirname(inspect.getfile(self.__class__)), plug)
             if os.path.exists(fake_plug):
                 shutil.copy(fake_plug, SOS_PLUGIN_DIR)
                 _installed.append(os.path.realpath(os.path.join(SOS_PLUGIN_DIR, plug)))
@@ -806,8 +844,10 @@ class StageTwoReportTest(BaseSoSReportTest):
                 return
             installed = self.installer.install_distro_packages(self.packages)
             if not installed:
-                raise("Unable to install requested packages %s"
-                      % ', '.join(pkg for pkg in self.packages[self.local_distro]))
+                raise Exception(
+                    "Unable to install requested packages %s"
+                    % ', '.join(self.packages[self.local_distro])
+                )
             # save installed package list to our tmpdir to be removed later
             self._write_file_to_tmpdir('mocked_packages', json.dumps(self.packages[self.local_distro]))
 
@@ -816,9 +856,10 @@ class StageTwoReportTest(BaseSoSReportTest):
         already exist on the test system, remove them from the list of packages
         to be installed.
         """
-        for pkg in self.packages[self.local_distro]:
-            if self.sm.check_installed(pkg):
-                self.packages[self.local_distro].remove(pkg)
+        self.packages[self.local_distro] = [
+            p for p in self.packages[self.local_distro] if not
+            self.sm.check_installed(p)
+        ]
 
     def teardown_mocked_packages(self):
         """Uninstall any packages that we installed for this test
@@ -830,23 +871,21 @@ class StageTwoReportTest(BaseSoSReportTest):
         for pkg in pkgs:
             self.sm.remove(pkg)
 
-    def _copy_test_file(self, src, dest=None):
+    def _copy_test_file(self, filetup):
         """Helper to copy files from tests/test_data to relevant locations on
         the test system. If ``dest`` is provided, use that as the destination
         filename instead of using the ``src`` name
         """
-
-        if dest is None:
-            dest = src
+        src, dest = filetup
         dir_added = False
         if os.path.exists(dest):
             os.rename(dest, dest + '.sostesting')
-        _dir = os.path.split(src)[0]
+        _dir = os.path.dirname(dest)
         if not os.path.exists(_dir):
             os.makedirs(_dir)
             self._created_files.append(_dir)
             dir_added = True
-        _test_file = os.path.join(SOS_TEST_DIR, 'test_data', src.lstrip('/'))
+        _test_file = os.path.join(os.path.dirname(inspect.getfile(self.__class__)), src.lstrip('/'))
         shutil.copy(_test_file, dest)
         if not dir_added:
             self._created_files.append(dest)
@@ -860,10 +899,9 @@ class StageTwoReportTest(BaseSoSReportTest):
         test(s) have run.
         """
         for mfile in self.files:
-            if isinstance(mfile, tuple):
-                self._copy_test_file(mfile[0], mfile[1])
-            else:
-                self._copy_test_file(mfile)
+            if not isinstance(mfile, tuple):
+                raise Exception(f"Mocked files must be provided via tuples, not {mfile.__class__}")
+            self._copy_test_file(mfile)
         if self._created_files:
             self._write_file_to_tmpdir('mocked_files', json.dumps(self._created_files))
 
@@ -938,7 +976,7 @@ class StageOneOutputTest(BaseSoSTest):
     sos_cmd = ''
 
     def _generate_sos_command(self):
-        return "%s %s" % (SOS_BIN, self.sos_cmd)
+        return "%s %s" % (self.sos_bin, self.sos_cmd)
 
     @skipIf(lambda x: x._exception_expected, "Non-zero exit code expected")
     def test_help_output_successful(self):

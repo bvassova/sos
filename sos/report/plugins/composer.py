@@ -10,12 +10,17 @@ from sos.report.plugins import Plugin, IndependentPlugin
 
 class Composer(Plugin, IndependentPlugin):
 
-    short_desc = 'Lorax Composer'
+    short_desc = 'OSBuild Composer'
 
     plugin_name = 'composer'
     profiles = ('sysmgmt', 'virt', )
 
-    packages = ('composer-cli',)
+    packages = (
+        'composer-cli',
+        'weldr-client',
+        'cockpit-composer',
+        'osbuild-composer',
+    )
 
     def _get_entries(self, cmd):
         entries = []
@@ -27,11 +32,14 @@ class Composer(Plugin, IndependentPlugin):
 
     def setup(self):
         self.add_copy_spec([
+            "/etc/osbuild-composer/osbuild-composer.toml",
+            "/etc/osbuild-worker/osbuild-worker.toml",
             "/etc/lorax/composer.conf",
+            "/etc/osbuild-composer",
             "/var/log/lorax-composer/composer.log",
             "/var/log/lorax-composer/dnf.log",
             "/var/log/lorax-composer/program.log",
-            "/var/log/lorax-composer/server.log",
+            "/var/log/lorax-composer/server.log"
         ])
         blueprints = self._get_entries("composer-cli blueprints list")
         for blueprint in blueprints:
@@ -40,5 +48,17 @@ class Composer(Plugin, IndependentPlugin):
         sources = self._get_entries("composer-cli sources list")
         for src in sources:
             self.add_cmd_output("composer-cli sources info %s" % src)
+
+        composes = self._get_entries("composer-cli compose list")
+        for compose in composes:
+            # the first column contains the compose id
+            self.add_cmd_output(
+                "composer-cli compose log %s" % compose.split(" ")[0]
+            )
+
+        self.add_journal(units=[
+            "osbuild-composer.service",
+            "osbuild-worker@*.service",
+        ])
 
 # vim: set et ts=4 sw=4 :

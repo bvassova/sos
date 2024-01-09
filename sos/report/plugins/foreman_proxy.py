@@ -22,7 +22,7 @@ class ForemanProxy(Plugin):
 
     def setup(self):
         self.add_file_tags({
-            '/var/log/foreman-proxy/proxy.log.*': 'foreman_proxy_log',
+            '/var/log/foreman-proxy/proxy.log': 'foreman_proxy_log',
             '/etc/foreman-proxy/settings.yml': 'foreman_proxy_conf'
         })
 
@@ -37,6 +37,10 @@ class ForemanProxy(Plugin):
             "/var/log/{}*/katello-reverse-proxy_access_ssl.log*".format(
                 self.apachepkg),
             "/var/log/{}*/katello-reverse-proxy_error_ssl.log*".format(
+                self.apachepkg),
+            "/var/log/{}*/rhsm-pulpcore-https-*_access_ssl.log*".format(
+                self.apachepkg),
+            "/var/log/{}*/rhsm-pulpcore-https-*_error_ssl.log*".format(
                 self.apachepkg),
         ])
 

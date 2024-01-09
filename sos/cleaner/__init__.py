@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import sos.cleaner.preppers
 import tempfile
 
 from concurrent.futures import ThreadPoolExecutor
@@ -25,19 +26,53 @@ from sos.cleaner.parsers.mac_parser import SoSMacParser
 from sos.cleaner.parsers.hostname_parser import SoSHostnameParser
 from sos.cleaner.parsers.keyword_parser import SoSKeywordParser
 from sos.cleaner.parsers.username_parser import SoSUsernameParser
+from sos.cleaner.parsers.ipv6_parser import SoSIPv6Parser
 from sos.cleaner.archives.sos import (SoSReportArchive, SoSReportDirectory,
                                       SoSCollectorArchive,
                                       SoSCollectorDirectory)
 from sos.cleaner.archives.generic import DataDirArchive, TarballArchive
 from sos.cleaner.archives.insights import InsightsArchive
-from sos.utilities import get_human_readable
+from sos.utilities import get_human_readable, import_module, ImporterHelper
 from textwrap import fill
 
 
 class SoSCleaner(SoSComponent):
-    """Take an sos report, or collection of sos reports, and scrub them of
-    potentially sensitive data such as IP addresses, hostnames, MAC addresses,
-    etc.. that are not obfuscated by individual plugins
+    """
+    This function is designed to obfuscate potentially sensitive information
+    from an sos report archive in a consistent and reproducible manner.
+
+    It may either be invoked during the creation of a report by using the
+    --clean option in the report command, or may be used on an already existing
+    archive by way of 'sos clean'.
+
+    The target of obfuscation are items such as IP addresses, MAC addresses,
+    hostnames, usernames, and also keywords provided by users via the
+    --keywords and/or --keyword-file options.
+
+    For every collection made in a report the collection is parsed for such
+    items, and when items are found SoS will generate an obfuscated replacement
+    for it, and in all places that item is found replace the text with the
+    obfuscated replacement mapped to it. These mappings are saved locally so
+    that future iterations will maintain the same consistent obfuscation
+    pairing.
+
+    In the case of IP addresses, support is for IPv4 and IPv6 - effort is made
+    to keep network topology intact so that later analysis is as accurate and
+    easily understandable as possible. If an IP address is encountered that we
+    cannot determine the netmask for, a random IP address is used instead.
+
+    For IPv6, note that IPv4-mapped addresses, e.g. ::ffff:10.11.12.13, are
+    NOT supported currently, and will remain unobfuscated.
+
+    For hostnames, domains are obfuscated as whole units, leaving the TLD in
+    place.
+
+    For instance, 'example.com' may be obfuscated to 'obfuscateddomain0.com'
+    and 'foo.example.com' may end up being 'obfuscateddomain1.com'.
+
+    Users will be notified of a 'mapping' file that records all items and the
+    obfuscated counterpart mapped to them for ease of reference later on. This
+    file should be kept private.
     """
 
     desc = "Obfuscate sensitive networking information in a report"
@@ -45,6 +80,7 @@ class SoSCleaner(SoSComponent):
     arg_defaults = {
         'archive_type': 'auto',
         'domains': [],
+        'disable_parsers': [],
         'jobs': 4,
         'keywords': [],
         'keyword_file': None,
@@ -80,6 +116,8 @@ class SoSCleaner(SoSComponent):
             # when obfuscating a SoSCollector run during archive extraction
             os.makedirs(os.path.join(self.tmpdir, 'cleaner'), exist_ok=True)
 
+        self.validate_parser_values()
+
         self.cleaner_mapping = self.load_map_file()
         os.umask(0o77)
         self.in_place = in_place
@@ -88,13 +126,25 @@ class SoSCleaner(SoSComponent):
         self.cleaner_md = self.manifest.components.add_section('cleaner')
 
         self.parsers = [
-            SoSHostnameParser(self.cleaner_mapping, self.opts.domains),
+            SoSHostnameParser(self.cleaner_mapping),
             SoSIPParser(self.cleaner_mapping),
+            SoSIPv6Parser(self.cleaner_mapping),
             SoSMacParser(self.cleaner_mapping),
-            SoSKeywordParser(self.cleaner_mapping, self.opts.keywords,
-                             self.opts.keyword_file),
-            SoSUsernameParser(self.cleaner_mapping, self.opts.usernames)
+            SoSKeywordParser(self.cleaner_mapping),
+            SoSUsernameParser(self.cleaner_mapping)
         ]
+
+        for _parser in self.opts.disable_parsers:
+            for _loaded in self.parsers:
+                _loaded_name = _loaded.name.lower().split('parser')[0].strip()
+                if _parser.lower().strip() == _loaded_name:
+                    self.log_info("Disabling parser: %s" % _loaded_name)
+                    self.ui_log.warning(
+                        "Disabling the '%s' parser. Be aware that this may "
+                        "leave sensitive plain-text data in the archive."
+                        % _parser
+                    )
+                    self.parsers.remove(_loaded)
 
         self.archive_types = [
             SoSReportDirectory,
@@ -129,6 +179,11 @@ class SoSCleaner(SoSComponent):
         for line in msg.splitlines():
             _fmt = _fmt + fill(line, width, replace_whitespace=False) + '\n'
         return _fmt
+
+    @classmethod
+    def display_help(cls, section):
+        section.set_title("SoS Cleaner Detailed Help")
+        section.add_text(cls.__doc__)
 
     def load_map_file(self):
         """Verifies that the map file exists and has usable content.
@@ -203,6 +258,10 @@ third party.
                                      'was generated as'))
         clean_grp.add_argument('--domains', action='extend', default=[],
                                help='List of domain names to obfuscate')
+        clean_grp.add_argument('--disable-parsers', action='extend',
+                               default=[], dest='disable_parsers',
+                               help=('Disable specific parsers, so that those '
+                                     'elements are not obfuscated'))
         clean_grp.add_argument('-j', '--jobs', default=4, type=int,
                                help='Number of concurrent archives to clean')
         clean_grp.add_argument('--keywords', action='extend', default=[],
@@ -264,6 +323,18 @@ third party.
         if self.nested_archive:
             self.nested_archive.ui_name = self.nested_archive.description
 
+    def validate_parser_values(self):
+        """Check any values passed to the parsers via the commandline, e.g.
+        the --domains option, to ensure that they are valid for the parser in
+        question.
+        """
+        for _dom in self.opts.domains:
+            if len(_dom.split('.')) < 2:
+                raise Exception(
+                    f"Invalid value '{_dom}' given: --domains values must be "
+                    "actual domains"
+                )
+
     def execute(self):
         """SoSCleaner will begin by inspecting the TARGET option to determine
         if it is a directory, archive, or archive of archives.
@@ -292,7 +363,13 @@ third party.
 
         # we have at least one valid target to obfuscate
         self.completed_reports = []
+        # TODO: as we separate mappings and parsers further, do this in a less
+        # janky manner
+        for parser in self.parsers:
+            if parser.name == 'Hostname Parser':
+                parser.mapping.set_initial_counts()
         self.preload_all_archives_into_maps()
+        self.generate_parser_item_regexes()
         self.obfuscate_report_paths()
 
         if not self.completed_reports:
@@ -328,24 +405,30 @@ third party.
                     cf.write(checksum)
             self.write_cleaner_log()
 
-        final_path = self.obfuscate_string(
-            os.path.join(self.sys_tmp, arc_path.split('/')[-1])
+        final_path = os.path.join(
+            self.sys_tmp,
+            self.obfuscate_string(arc_path.split('/')[-1])
         )
         shutil.move(arc_path, final_path)
         arcstat = os.stat(final_path)
 
-        # logging will have been shutdown at this point
-        print("A mapping of obfuscated elements is available at\n\t%s"
-              % map_path)
+        # while these messages won't be included in the log file in the archive
+        # some facilities, such as our avocado test suite, will sometimes not
+        # capture print() output, so leverage the ui_log to print to console
+        self.ui_log.info(
+            f"A mapping of obfuscated elements is available at\n\t{map_path}"
+        )
+        self.ui_log.info(
+            f"\nThe obfuscated archive is available at\n\t{final_path}\n"
+        )
 
-        print("\nThe obfuscated archive is available at\n\t%s\n" % final_path)
-        print("\tSize\t%s" % get_human_readable(arcstat.st_size))
-        print("\tOwner\t%s\n" % getpwuid(arcstat.st_uid).pw_name)
-
-        print("Please send the obfuscated archive to your support "
-              "representative and keep the mapping file private")
+        self.ui_log.info(f"\tSize\t{get_human_readable(arcstat.st_size)}")
+        self.ui_log.info(f"\tOwner\t{getpwuid(arcstat.st_uid).pw_name}\n")
+        self.ui_log.info("Please send the obfuscated archive to your support "
+                         "representative and keep the mapping file private")
 
         self.cleanup()
+        return None
 
     def rebuild_nested_archive(self):
         """Handles repacking the nested tarball, now containing only obfuscated
@@ -380,7 +463,7 @@ third party.
         _map = {}
         for parser in self.parsers:
             _map[parser.map_file_key] = {}
-            _map[parser.map_file_key].update(parser.mapping.dataset)
+            _map[parser.map_file_key].update(parser.get_map_contents())
 
         return _map
 
@@ -394,8 +477,9 @@ third party.
 
     def write_map_for_archive(self, _map):
         try:
-            map_path = self.obfuscate_string(
-                os.path.join(self.sys_tmp, "%s-private_map" % self.arc_name)
+            map_path = os.path.join(
+                self.sys_tmp,
+                self.obfuscate_string("%s-private_map" % self.arc_name)
             )
             return self.write_map_to_file(_map, map_path)
         except Exception as err:
@@ -442,15 +526,14 @@ third party.
         """
         try:
             hash_size = 1024**2  # Hash 1MiB of content at a time.
-            archive_fp = open(archive_path, 'rb')
-            digest = hashlib.new(self.hash_name)
-            while True:
-                hashdata = archive_fp.read(hash_size)
-                if not hashdata:
-                    break
-                digest.update(hashdata)
-            archive_fp.close()
-            return digest.hexdigest() + '\n'
+            with open(archive_path, 'rb') as archive_fp:
+                digest = hashlib.new(self.hash_name)
+                while True:
+                    hashdata = archive_fp.read(hash_size)
+                    if not hashdata:
+                        break
+                    digest.update(hashdata)
+                return digest.hexdigest() + '\n'
         except Exception as err:
             self.log_debug("Could not generate new checksum: %s" % err)
         return None
@@ -497,6 +580,71 @@ third party.
             shutil.move(archive.final_archive_path, dest)
             archive.final_archive_path = dest_name
 
+    def generate_parser_item_regexes(self):
+        """For the parsers that use prebuilt lists of items, generate those
+        regexes now since all the parsers should be preloaded by the archive(s)
+        as well as being handed cmdline options and mapping file configuration.
+        """
+        for parser in self.parsers:
+            parser.generate_item_regexes()
+
+    def _prepare_archive_with_prepper(self, archive, prepper):
+        """
+        For each archive we've determined we need to operate on, pass it to
+        each prepper so that we can extract necessary files and/or items for
+        direct regex replacement. Preppers define these methods per parser,
+        so it is possible that a single prepper will read the same file for
+        different parsers/mappings. This is preferable to the alternative of
+        building up monolithic lists of file paths, as we'd still need to
+        manipulate these on a per-archive basis.
+
+        :param archive: The archive we are currently using to prepare our
+                        mappings with
+        :type archive:  ``SoSObfuscationArchive`` subclass
+
+        :param prepper: The individual prepper we're using to source items
+        :type prepper:  ``SoSPrepper`` subclass
+        """
+        for _parser in self.parsers:
+            pname = _parser.name.lower().split()[0].strip()
+            for _file in prepper.get_parser_file_list(pname, archive):
+                content = archive.get_file_content(_file)
+                if not content:
+                    continue
+                self.log_debug(f"Prepping {pname} parser with file {_file} "
+                               f"from {archive.ui_name}")
+                for line in content.splitlines():
+                    try:
+                        _parser.parse_line(line)
+                    except Exception as err:
+                        self.log_debug(
+                            f"Failed to prep {pname} map from {_file}: {err}"
+                        )
+            map_items = prepper.get_items_for_map(pname, archive)
+            if map_items:
+                self.log_debug(f"Prepping {pname} mapping with items from "
+                               f"{archive.ui_name}")
+                for item in map_items:
+                    _parser.mapping.add(item)
+
+            for ritem in prepper.regex_items[pname]:
+                _parser.mapping.add_regex_item(ritem)
+
+    def get_preppers(self):
+        """
+        Discover all locally available preppers so that we can prepare the
+        mappings with obfuscation matches in a controlled manner
+
+        :returns: All preppers that can be leveraged locally
+        :rtype:   A generator of `SoSPrepper` items
+        """
+        helper = ImporterHelper(sos.cleaner.preppers)
+        preps = []
+        for _prep in helper.get_modules():
+            preps.extend(import_module(f"sos.cleaner.preppers.{_prep}"))
+        for prepper in sorted(preps, key=lambda x: x.priority):
+            yield prepper(options=self.opts)
+
     def preload_all_archives_into_maps(self):
         """Before doing the actual obfuscation, if we have multiple archives
         to obfuscate then we need to preload each of them into the mappings
@@ -504,42 +652,9 @@ third party.
         obfuscated in node1's archive.
         """
         self.log_info("Pre-loading all archives into obfuscation maps")
-        for _arc in self.report_paths:
-            for _parser in self.parsers:
-                try:
-                    pfile = _arc.prep_files[_parser.name.lower().split()[0]]
-                    if not pfile:
-                        continue
-                except (IndexError, KeyError):
-                    continue
-                if isinstance(pfile, str):
-                    pfile = [pfile]
-                for parse_file in pfile:
-                    self.log_debug("Attempting to load %s" % parse_file)
-                    try:
-                        content = _arc.get_file_content(parse_file)
-                        if not content:
-                            continue
-                        if isinstance(_parser, SoSUsernameParser):
-                            _parser.load_usernames_into_map(content)
-                        elif isinstance(_parser, SoSHostnameParser):
-                            if 'hostname' in parse_file:
-                                _parser.load_hostname_into_map(
-                                    content.splitlines()[0]
-                                )
-                            elif 'etc/hosts' in parse_file:
-                                _parser.load_hostname_from_etc_hosts(
-                                    content
-                                )
-                        else:
-                            for line in content.splitlines():
-                                self.obfuscate_line(line)
-                    except Exception as err:
-                        self.log_info(
-                            "Could not prepare %s from %s (archive: %s): %s"
-                            % (_parser.name, parse_file, _arc.archive_name,
-                               err)
-                        )
+        for prepper in self.get_preppers():
+            for archive in self.report_paths:
+                self._prepare_archive_with_prepper(archive, prepper)
 
     def obfuscate_report(self, archive):
         """Individually handle each archive or directory we've discovered by
@@ -558,8 +673,7 @@ third party.
                 archive.extract()
             archive.report_msg("Beginning obfuscation...")
 
-            file_list = archive.get_file_list()
-            for fname in file_list:
+            for fname in archive.get_file_list():
                 short_name = fname.split(archive.archive_name + '/')[1]
                 if archive.should_skip_file(short_name):
                     continue
@@ -575,10 +689,17 @@ third party.
                 except Exception as err:
                     self.log_debug("Unable to parse file %s: %s"
                                    % (short_name, err))
+
             try:
                 self.obfuscate_directory_names(archive)
             except Exception as err:
                 self.log_info("Failed to obfuscate directories: %s" % err,
+                              caller=archive.archive_name)
+
+            try:
+                self.obfuscate_symlinks(archive)
+            except Exception as err:
+                self.log_info("Failed to obfuscate symlinks: %s" % err,
                               caller=archive.archive_name)
 
             # if the archive was already a tarball, repack it
@@ -630,7 +751,7 @@ third party.
         """
         if not filename:
             # the requested file doesn't exist in the archive
-            return
+            return None
         subs = 0
         if not short_name:
             short_name = filename.split('/')[-1]
@@ -640,10 +761,16 @@ third party.
             self.log_debug("Obfuscating %s" % short_name or filename,
                            caller=arc_name)
             tfile = tempfile.NamedTemporaryFile(mode='w', dir=self.tmpdir)
-            with open(filename, 'r') as fname:
+            _parsers = [
+                _p for _p in self.parsers if not
+                any(
+                    _skip.match(short_name) for _skip in _p.skip_patterns
+                )
+            ]
+            with open(filename, 'r', errors='replace') as fname:
                 for line in fname:
                     try:
-                        line, count = self.obfuscate_line(line)
+                        line, count = self.obfuscate_line(line, _parsers)
                         subs += count
                         tfile.write(line)
                     except Exception as err:
@@ -651,20 +778,14 @@ third party.
                                        % (short_name, err), caller=arc_name)
             tfile.seek(0)
             if subs:
-                shutil.copy(tfile.name, filename)
+                shutil.copyfile(tfile.name, filename)
             tfile.close()
 
         _ob_short_name = self.obfuscate_string(short_name.split('/')[-1])
         _ob_filename = short_name.replace(short_name.split('/')[-1],
                                           _ob_short_name)
-        _sym_changed = False
-        if os.path.islink(filename):
-            _link = os.readlink(filename)
-            _ob_link = self.obfuscate_string(_link)
-            if _ob_link != _link:
-                _sym_changed = True
 
-        if (_ob_filename != short_name) or _sym_changed:
+        if _ob_filename != short_name:
             arc_path = filename.split(short_name)[0]
             _ob_path = os.path.join(arc_path, _ob_filename)
             # ensure that any plugin subdirs that contain obfuscated strings
@@ -683,6 +804,41 @@ third party.
                 os.symlink(_target_ob, _ob_path)
 
         return subs
+
+    def obfuscate_symlinks(self, archive):
+        """Iterate over symlinks in the archive and obfuscate their names.
+        The content of the link target will have already been cleaned, and this
+        second pass over just the names of the links is to ensure we avoid a
+        possible race condition dependent on the order in which the link or the
+        target get obfuscated.
+
+        :param archive:     The archive being obfuscated
+        :type archive:      ``SoSObfuscationArchive``
+        """
+        self.log_info("Obfuscating symlink names", caller=archive.archive_name)
+        for symlink in archive.get_symlinks():
+            try:
+                # relative name of the symlink in the archive
+                _sym = symlink.split(archive.extracted_path)[1].lstrip('/')
+                self.log_debug("Obfuscating symlink %s" % _sym,
+                               caller=archive.archive_name)
+                # current target of symlink, again relative to the archive
+                _target = os.readlink(symlink)
+                # get the potentially renamed symlink name, this time the full
+                # path as it exists on disk
+                _ob_sym_name = os.path.join(archive.extracted_path,
+                                            self.obfuscate_string(_sym))
+                # get the potentially renamed relative target filename
+                _ob_target = self.obfuscate_string(_target)
+
+                # if either the symlink name or the target name has changed,
+                # recreate the symlink
+                if (_ob_sym_name != symlink) or (_ob_target != _target):
+                    os.remove(symlink)
+                    os.symlink(_ob_target, _ob_sym_name)
+            except Exception as err:
+                self.log_info("Error obfuscating symlink '%s': %s"
+                              % (symlink, err))
 
     def obfuscate_directory_names(self, archive):
         """For all directories that exist within the archive, obfuscate the
@@ -709,11 +865,11 @@ third party.
         for parser in self.parsers:
             try:
                 string_data = parser.parse_string_for_keys(string_data)
-            except Exception:
-                pass
+            except Exception as err:
+                self.log_info("Error obfuscating string data: %s" % err)
         return string_data
 
-    def obfuscate_line(self, line):
+    def obfuscate_line(self, line, parsers=None):
         """Run a line through each of the obfuscation parsers, keeping a
         cumulative total of substitutions done on that particular line.
 
@@ -721,6 +877,8 @@ third party.
 
             :param line str:        The raw line as read from the file being
                                     processed
+            :param parsers:         A list of parser objects to obfuscate
+                                    with. If None, use all.
 
         Returns the fully obfuscated line and the number of substitutions made
         """
@@ -729,7 +887,9 @@ third party.
         count = 0
         if not line.strip():
             return line, count
-        for parser in self.parsers:
+        if parsers is None:
+            parsers = self.parsers
+        for parser in parsers:
             try:
                 line, _count = parser.parse_line(line)
                 count += _count

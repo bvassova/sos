@@ -1,3 +1,4 @@
+import logging
 import os
 import platform
 import time
@@ -5,12 +6,14 @@ import json
 import tempfile
 import random
 import string
+import sys
 
 from pwd import getpwuid
 from sos.presets import (NO_PRESET, GENERIC_PRESETS, PRESETS_PATH,
                          PresetDefaults, DESC, NOTE, OPTS)
 from sos.policies.package_managers import PackageManager
-from sos.utilities import ImporterHelper, import_module, get_human_readable
+from sos.utilities import (ImporterHelper, import_module, get_human_readable,
+                           bold)
 from sos.report.plugins import IndependentPlugin, ExperimentalPlugin
 from sos.options import SoSOptions
 from sos import _sos as _
@@ -39,13 +42,16 @@ def load(cache={}, sysroot=None, init=None, probe_runtime=True,
                                          probe_runtime=probe_runtime,
                                          remote_exec=remote_exec)
 
+    if sys.platform != 'linux':
+        raise Exception("SoS is not supported on this platform")
+
     if 'policy' not in cache:
-        cache['policy'] = GenericPolicy()
+        cache['policy'] = sos.policies.distros.GenericLinuxPolicy()
 
     return cache['policy']
 
 
-class Policy(object):
+class Policy():
     """Policies represent distributions that sos supports, and define the way
     in which sos behaves on those distributions. A policy should define at
     minimum a way to identify the distribution, and a package manager to allow
@@ -62,6 +68,11 @@ class Policy(object):
 
     :param probe_runtime: Should the Policy try to load a ContainerRuntime
     :type probe_runtime: ``bool``
+
+    :param remote_exec:     If this policy is loaded for a remote node, use
+                            this to facilitate executing commands via the
+                            SoSTransport in use
+    :type remote_exec:      ``SoSTranport.run_command()``
 
     :cvar distro: The name of the distribution the Policy represents
     :vartype distro: ``str``
@@ -110,21 +121,24 @@ any third party.
     presets = {"": PresetDefaults()}
     presets_path = PRESETS_PATH
     _in_container = False
-    _host_sysroot = '/'
 
-    def __init__(self, sysroot=None, probe_runtime=True):
+    def __init__(self, sysroot=None, probe_runtime=True, remote_exec=None):
         """Subclasses that choose to override this initializer should call
         super() to ensure that they get the required platform bits attached.
         super(SubClass, self).__init__(). Policies that require runtime
         tests to construct PATH must call self.set_exec_path() after
         modifying PATH in their own initializer."""
+        self.soslog = logging.getLogger('sos')
+        self.ui_log = logging.getLogger('sos_ui')
         self._parse_uname()
         self.case_id = None
         self.probe_runtime = probe_runtime
         self.package_manager = PackageManager()
         self.valid_subclasses = [IndependentPlugin]
-        self.set_exec_path()
-        self._host_sysroot = sysroot
+        self.remote_exec = remote_exec
+        if not self.remote_exec:
+            self.set_exec_path()
+        self.sysroot = sysroot
         self.register_presets(GENERIC_PRESETS)
 
     def check(self, remote=''):
@@ -164,6 +178,7 @@ any third party.
         override subclass-specific paths
         """
         return [
+            '*.egg',
             '*.pyc',
             '*.pyo',
             '*.swp'
@@ -176,14 +191,6 @@ any third party.
         :rtype: ``bool``
         """
         return self._in_container
-
-    def host_sysroot(self):
-        """Get the host's default sysroot
-
-        :returns: Host sysroot
-        :rtype: ``str`` or ``None``
-        """
-        return self._host_sysroot
 
     def dist_version(self):
         """
@@ -218,7 +225,7 @@ any third party.
 
             * name  - the short hostname of the system
             * label - the label given by --label
-            * case  - the case id given by --case-id or --ticker-number
+            * case  - the case id given by --case-id
             * rand  - a random string of 7 alpha characters
 
         Note that if a datestamp is needed, the substring should be set
@@ -276,9 +283,9 @@ any third party.
         :param plugin_classes: The classes that the Plugin subclasses
         :type plugin_classes: ``list``
 
-        :returns: The first subclass that matches one of the Policy's
+        :returns: The first tagging class that matches one of the Policy's
                   `valid_subclasses`
-        :rtype: A tagging class for Plugins
+        :rtype: ``PluginDistroTag``
         """
         if len(plugin_classes) > 1:
             for p in plugin_classes:
@@ -294,7 +301,7 @@ any third party.
         Verifies that the plugin_class should execute under this policy
 
         :param plugin_class: The tagging class being checked
-        :type plugin_class: A Plugin() tagging class
+        :type plugin_class: ``PluginDistroTag``
 
         :returns: ``True`` if the `plugin_class` is allowed by the policy
         :rtype: ``bool``
@@ -362,6 +369,49 @@ any third party.
         to use"""
         return "sha256"
 
+    @classmethod
+    def display_help(self, section):
+        section.set_title('SoS Policies')
+        section.add_text(
+            'Policies help govern how SoS operates on across different distri'
+            'butions of Linux. They control aspects such as plugin enablement,'
+            ' $PATH determination, how/which package managers are queried, '
+            'default upload specifications, and more.'
+        )
+
+        section.add_text(
+            "When SoS intializes most functions, for example %s and %s, one "
+            "of the first operations is to determine the correct policy to "
+            "load for the local system. Policies will determine the proper "
+            "package manager to use, any applicable container runtime(s), and "
+            "init systems so that SoS and report plugins can properly function"
+            " for collections. Generally speaking a single policy will map to"
+            " a single distribution; for example there are separate policies "
+            "for Debian, Ubuntu, RHEL, and Fedora."
+            % (bold('sos report'), bold('sos collect'))
+        )
+
+        section.add_text(
+            "It is currently not possible for users to directly control which "
+            "policy is loaded."
+        )
+
+        pols = {
+            'policies.cos': 'The Google Cloud-Optimized OS distribution',
+            'policies.debian': 'The Debian distribution',
+            'policies.redhat': ('Red Hat family distributions, not necessarily'
+                                ' including forks'),
+            'policies.ubuntu': 'Ubuntu/Canonical distributions'
+        }
+
+        seealso = section.add_section('See Also')
+        seealso.add_text(
+            "For more information on distribution policies, see below\n"
+        )
+        for pol in pols:
+            seealso.add_text("{:>8}{:<20}{:<30}".format(' ', pol, pols[pol]),
+                             newline=False)
+
     def display_results(self, archive, directory, checksum, archivestat=None,
                         map_file=None):
         """Display final information about a generated archive
@@ -382,44 +432,42 @@ any third party.
                          file for this run
         :type map_file: ``str``
         """
-        # Logging is already shutdown and all terminal output must use the
-        # print() call.
+        # Logging is shut down, but there are some edge cases where automation
+        # does not capture printed output (e.g. avocado CI). Use the ui_log to
+        # still print to console in this case.
 
         # make sure a report exists
         if not archive and not directory:
             return False
 
-        self._print()
-
         if map_file:
-            self._print(_("A mapping of obfuscated elements is available at"
-                          "\n\t%s\n" % map_file))
+            self.ui_log.info(
+                _(f"\nA mapping of obfuscated elements is available at"
+                  f"\n\t{map_file}")
+            )
 
         if archive:
-            self._print(_("Your sosreport has been generated and saved "
-                          "in:\n\t%s\n") % archive, always=True)
-            self._print(_(" Size\t%s") %
-                        get_human_readable(archivestat.st_size))
-            self._print(_(" Owner\t%s") %
-                        getpwuid(archivestat.st_uid).pw_name)
+            self.ui_log.info(
+                _(f"\nYour sosreport has been generated and saved in:"
+                  f"\n\t{archive}\n")
+            )
+            self.ui_log.info(
+                _(f" Size\t{get_human_readable(archivestat.st_size)}")
+            )
+            self.ui_log.info(
+                _(f" Owner\t{getpwuid(archivestat.st_uid).pw_name}")
+            )
         else:
-            self._print(_("Your sosreport build tree has been generated "
-                          "in:\n\t%s\n") % directory, always=True)
+            self.ui_log.info(
+                _(f"Your sosreport build tree has been generated in:"
+                  f"\n\t{directory}\n")
+            )
         if checksum:
-            self._print(" " + self.get_preferred_hash_name() + "\t" + checksum)
-            self._print()
-            self._print(_("Please send this file to your support "
-                          "representative."))
-        self._print()
-
-    def _print(self, msg=None, always=False):
-        """A wrapper around print that only prints if we are not running in
-        quiet mode"""
-        if always or not self.commons['cmdlineopts'].quiet:
-            if msg:
-                print(msg)
-            else:
-                print()
+            self.ui_log.info(f" {self.get_preferred_hash_name()}\t{checksum}")
+            self.ui_log.info(
+                _("\nPlease send this file to your support representative.\n")
+            )
+        return None
 
     def get_msg(self):
         """This method is used to prepare the preamble text to display to
@@ -561,14 +609,6 @@ any third party.
 
         preset.delete(self.presets_path)
         self.presets.pop(name)
-
-
-class GenericPolicy(Policy):
-    """This Policy will be returned if no other policy can be loaded. This
-    should allow for IndependentPlugins to be executed on any system"""
-
-    def get_msg(self):
-        return self.msg % {'distro': self.system}
 
 
 # vim: set et ts=4 sw=4 :

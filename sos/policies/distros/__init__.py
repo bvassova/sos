@@ -17,10 +17,13 @@ from sos import _sos as _
 from sos.policies import Policy
 from sos.policies.init_systems import InitSystem
 from sos.policies.init_systems.systemd import SystemdInit
+from sos.policies.runtimes.crio import CrioContainerRuntime
 from sos.policies.runtimes.podman import PodmanContainerRuntime
 from sos.policies.runtimes.docker import DockerContainerRuntime
+from sos.policies.runtimes.lxd import LxdContainerRuntime
 
-from sos.utilities import shell_out, is_executable
+from sos.utilities import (shell_out, is_executable, bold,
+                           sos_get_command_output)
 
 
 try:
@@ -68,22 +71,23 @@ class LinuxPolicy(Policy):
     container_version_command = None
     container_authfile = None
 
-    def __init__(self, sysroot=None, init=None, probe_runtime=True):
+    def __init__(self, sysroot=None, init=None, probe_runtime=True,
+                 remote_exec=None):
         super(LinuxPolicy, self).__init__(sysroot=sysroot,
-                                          probe_runtime=probe_runtime)
-        self.init_kernel_modules()
+                                          probe_runtime=probe_runtime,
+                                          remote_exec=remote_exec)
 
-        # need to set _host_sysroot before PackageManager()
         if sysroot:
-            self._container_init()
-            self._host_sysroot = sysroot
+            self.sysroot = sysroot
         else:
-            sysroot = self._container_init()
+            self.sysroot = self._container_init() or '/'
+
+        self.init_kernel_modules()
 
         if init is not None:
             self.init_system = init
         elif os.path.isdir("/run/systemd/system/"):
-            self.init_system = SystemdInit(chroot=sysroot)
+            self.init_system = SystemdInit(chroot=self.sysroot)
         else:
             self.init_system = InitSystem()
 
@@ -91,7 +95,9 @@ class LinuxPolicy(Policy):
         if self.probe_runtime:
             _crun = [
                 PodmanContainerRuntime(policy=self),
-                DockerContainerRuntime(policy=self)
+                DockerContainerRuntime(policy=self),
+                CrioContainerRuntime(policy=self),
+                LxdContainerRuntime(policy=self),
             ]
             for runtime in _crun:
                 if runtime.check_is_active():
@@ -113,15 +119,6 @@ class LinuxPolicy(Policy):
             '/etc/shadow'
         ]
 
-    def default_runlevel(self):
-        try:
-            with open("/etc/inittab") as fp:
-                pattern = r"id:(\d{1}):initdefault:"
-                text = fp.read()
-                return int(re.findall(pattern, text)[0])
-        except (IndexError, IOError):
-            return 3
-
     def kernel_version(self):
         return self.release
 
@@ -141,6 +138,73 @@ class LinuxPolicy(Policy):
     def sanitize_filename(self, name):
         return re.sub(r"[^-a-z,A-Z.0-9]", "", name)
 
+    @classmethod
+    def display_help(cls, section):
+        if cls == LinuxPolicy:
+            cls.display_self_help(section)
+        else:
+            section.set_title("%s Distribution Policy" % cls.distro)
+            cls.display_distro_help(section)
+
+    @classmethod
+    def display_self_help(cls, section):
+        section.set_title("SoS Distribution Policies")
+        section.add_text(
+            'Distributions supported by SoS will each have a specific policy '
+            'defined for them, to ensure proper operation of SoS on those '
+            'systems.'
+        )
+
+    @classmethod
+    def display_distro_help(cls, section):
+        if cls.__doc__ and cls.__doc__ is not LinuxPolicy.__doc__:
+            section.add_text(cls.__doc__)
+        else:
+            section.add_text(
+                '\nDetailed help information for this policy is not available'
+            )
+
+        # instantiate the requested policy so we can report more interesting
+        # information like $PATH and loaded presets
+        _pol = cls(None, None, False)
+        section.add_text(
+            "Default --upload location: %s" % _pol._upload_url
+        )
+        section.add_text(
+            "Default container runtime: %s" % _pol.default_container_runtime,
+            newline=False
+        )
+        section.add_text(
+            "$PATH used when running report: %s" % _pol.PATH,
+            newline=False
+        )
+
+        refsec = section.add_section('Reference URLs')
+        for url in cls.vendor_urls:
+            refsec.add_text(
+                "{:>8}{:<30}{:<40}".format(' ', url[0], url[1]),
+                newline=False
+            )
+
+        presec = section.add_section('Presets Available With This Policy\n')
+        presec.add_text(
+            bold(
+                "{:>8}{:<20}{:<45}{:<30}".format(' ', 'Preset Name',
+                                                 'Description',
+                                                 'Enabled Options')
+            ),
+            newline=False
+        )
+        for preset in _pol.presets:
+            _preset = _pol.presets[preset]
+            _opts = ' '.join(_preset.opts.to_args())
+            presec.add_text(
+                "{:>8}{:<20}{:<45}{:<30}".format(
+                    ' ', preset, _preset.desc, _opts
+                ),
+                newline=False
+            )
+
     def _container_init(self):
         """Check if sos is running in a container and perform container
         specific initialisation based on ENV_HOST_SYSROOT.
@@ -148,28 +212,33 @@ class LinuxPolicy(Policy):
         if ENV_CONTAINER in os.environ:
             if os.environ[ENV_CONTAINER] in ['docker', 'oci', 'podman']:
                 self._in_container = True
-        if ENV_HOST_SYSROOT in os.environ:
-            self._host_sysroot = os.environ[ENV_HOST_SYSROOT]
-        use_sysroot = self._in_container and self._host_sysroot is not None
-        if use_sysroot:
-            host_tmp_dir = os.path.abspath(self._host_sysroot + self._tmp_dir)
-            self._tmp_dir = host_tmp_dir
-        return self._host_sysroot if use_sysroot else None
+                if ENV_HOST_SYSROOT in os.environ:
+                    if not os.environ[ENV_HOST_SYSROOT]:
+                        # guard against blank/improperly unset values
+                        return None
+                    self._tmp_dir = os.path.abspath(
+                        os.environ[ENV_HOST_SYSROOT] + self._tmp_dir
+                    )
+                    return os.environ[ENV_HOST_SYSROOT]
+        return None
 
     def init_kernel_modules(self):
         """Obtain a list of loaded kernel modules to reference later for plugin
         enablement and SoSPredicate checks
         """
         self.kernel_mods = []
+        release = os.uname().release
 
         # first load modules from lsmod
-        lines = shell_out("lsmod", timeout=0).splitlines()
+        lines = shell_out("lsmod", timeout=0, chroot=self.sysroot).splitlines()
         self.kernel_mods.extend([
             line.split()[0].strip() for line in lines[1:]
         ])
 
         # next, include kernel builtins
-        builtins = "/usr/lib/modules/%s/modules.builtin" % os.uname().release
+        builtins = self.join_sysroot(
+            "/usr/lib/modules/%s/modules.builtin" % release
+        )
         try:
             with open(builtins, "r") as mfile:
                 for line in mfile:
@@ -186,7 +255,7 @@ class LinuxPolicy(Policy):
             'dm_mod': 'CONFIG_BLK_DEV_DM'
         }
 
-        booted_config = "/boot/config-%s" % os.uname().release
+        booted_config = self.join_sysroot("/boot/config-%s" % release)
         kconfigs = []
         try:
             with open(booted_config, "r") as kfile:
@@ -200,11 +269,19 @@ class LinuxPolicy(Policy):
             if config_strings[builtin] in kconfigs:
                 self.kernel_mods.append(builtin)
 
+    def join_sysroot(self, path):
+        if self.sysroot and self.sysroot != '/':
+            path = os.path.join(self.sysroot, path.lstrip('/'))
+        return path
+
     def pre_work(self):
         # this method will be called before the gathering begins
 
         cmdline_opts = self.commons['cmdlineopts']
         caseid = cmdline_opts.case_id if cmdline_opts.case_id else ""
+
+        if cmdline_opts.low_priority:
+            self._configure_low_priority()
 
         # Set the cmdline settings to the class attrs that are referenced later
         # The policy default '_' prefixed versions of these are untouched to
@@ -215,6 +292,7 @@ class LinuxPolicy(Policy):
         self.upload_password = cmdline_opts.upload_pass
         self.upload_archive_name = ''
 
+        # set or query for case id
         if not cmdline_opts.batch and not \
                 cmdline_opts.quiet:
             try:
@@ -225,19 +303,56 @@ class LinuxPolicy(Policy):
                         _("Optionally, please enter the case id that you are "
                           "generating this report for [%s]: ") % caseid
                     )
+            except KeyboardInterrupt:
+                raise
+        if cmdline_opts.case_id:
+            self.case_id = cmdline_opts.case_id
+
+        # set or query for upload credentials; this needs to be done after
+        # setting case id, as below methods might rely on detection of it
+        if not cmdline_opts.batch and not \
+                cmdline_opts.quiet:
+            try:
                 # Policies will need to handle the prompts for user information
                 if cmdline_opts.upload and self.get_upload_url():
                     self.prompt_for_upload_user()
                     self.prompt_for_upload_password()
-                self._print()
+                self.ui_log.info('')
             except KeyboardInterrupt:
-                self._print()
                 raise
 
-        if cmdline_opts.case_id:
-            self.case_id = cmdline_opts.case_id
-
         return
+
+    def _configure_low_priority(self):
+        """Used to constrain sos to a 'low priority' execution, potentially
+        letting individual policies set their own definition of what that is.
+
+        By default, this will attempt to assign sos to an idle io class via
+        ionice if available. We will also renice our own pid to 19 in order to
+        not cause competition with other host processes for CPU time.
+        """
+        _pid = os.getpid()
+        if is_executable('ionice'):
+            ret = sos_get_command_output(
+                f"ionice -c3 -p {_pid}", timeout=5
+            )
+            if ret['status'] == 0:
+                self.soslog.info('Set IO class to idle')
+            else:
+                msg = (f"Error setting IO class to idle: {ret['output']} "
+                       f"(exit code {ret['status']})")
+                self.soslog.error(msg)
+        else:
+            self.ui_log.warning(
+                "Warning: unable to constrain report to idle IO class: "
+                "ionice is not available."
+            )
+
+        try:
+            os.nice(20)
+            self.soslog.info('Set niceness of report to 19')
+        except Exception as err:
+            self.soslog.error(f"Error setting report niceness to 19: {err}")
 
     def prompt_for_upload_user(self):
         """Should be overridden by policies to determine if a user needs to
@@ -262,7 +377,7 @@ class LinuxPolicy(Policy):
         Entry point for sos attempts to upload the generated archive to a
         policy or user specified location.
 
-        Curerntly there is support for HTTPS, SFTP, and FTP. HTTPS uploads are
+        Currently there is support for HTTPS, SFTP, and FTP. HTTPS uploads are
         preferred for policy-defined defaults.
 
         Policies that need to override uploading methods should override the
@@ -308,7 +423,9 @@ class LinuxPolicy(Policy):
             raise Exception("No upload destination provided by policy or by "
                             "--upload-url")
         upload_func = self._determine_upload_type()
-        print(_("Attempting upload to %s" % self.get_upload_url_string()))
+        self.ui_log.info(
+            _(f"Attempting upload to {self.get_upload_url_string()}")
+        )
         return upload_func()
 
     def _determine_upload_type(self):
@@ -341,7 +458,7 @@ class LinuxPolicy(Policy):
         :param password: Password for `user` to use for upload
         :type password: ``str``
 
-        :returns: The user/password auth suitable for use in reqests calls
+        :returns: The user/password auth suitable for use in requests calls
         :rtype: ``requests.auth.HTTPBasicAuth()``
         """
         if not user:
@@ -473,7 +590,8 @@ class LinuxPolicy(Policy):
         put_expects = [
             u'100%',
             pexpect.TIMEOUT,
-            pexpect.EOF
+            pexpect.EOF,
+            u'No such file or directory'
         ]
 
         put_success = ret.expect(put_expects, timeout=180)
@@ -485,6 +603,8 @@ class LinuxPolicy(Policy):
             raise Exception("Timeout expired while uploading")
         elif put_success == 2:
             raise Exception("Unknown error during upload: %s" % ret.before)
+        elif put_success == 3:
+            raise Exception("Unable to write archive to destination")
         else:
             raise Exception("Unexpected response from server: %s" % ret.before)
 
@@ -496,7 +616,10 @@ class LinuxPolicy(Policy):
         :returns:       Filename as it will exist on the SFTP server
         :rtype:         ``str``
         """
-        return self.upload_archive_name.split('/')[-1]
+        fname = self.upload_archive_name.split('/')[-1]
+        if self.upload_directory:
+            fname = os.path.join(self.upload_directory, fname)
+        return fname
 
     def _upload_https_put(self, archive, verify=True):
         """If upload_https() needs to use requests.put(), use this method.
@@ -551,7 +674,7 @@ class LinuxPolicy(Policy):
                 r = self._upload_https_put(arc, verify)
             else:
                 r = self._upload_https_post(arc, verify)
-            if r.status_code != 201:
+            if r.status_code != 200 and r.status_code != 201:
                 if r.status_code == 401:
                     raise Exception(
                         "Authentication failed: invalid user credentials"
@@ -705,3 +828,19 @@ class LinuxPolicy(Policy):
                                       cmd)
         else:
             return cmd
+
+
+class GenericLinuxPolicy(LinuxPolicy):
+    """This Policy will be returned if no other policy can be loaded. This
+    should allow for IndependentPlugins to be executed on any system"""
+
+    vendor_urls = [('Upstream Project', 'https://github.com/sosreport/sos')]
+    vendor = 'SoS'
+    vendor_text = ('SoS was unable to determine that the distribution of this '
+                   'system is supported, and has loaded a generic '
+                   'configuration. This may not provide desired behavior, and '
+                   'users are encouraged to request a new distribution-specifc'
+                   ' policy at the GitHub project above.\n')
+
+
+# vim: set et ts=4 sw=4 :

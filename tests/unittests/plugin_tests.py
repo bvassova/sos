@@ -9,6 +9,7 @@ import unittest
 import os
 import tempfile
 import shutil
+import random
 
 from io import StringIO
 
@@ -16,6 +17,7 @@ from sos.report.plugins import Plugin, regex_findall, _mangle_command, PluginOpt
 from sos.archive import TarFileArchive
 from sos.policies.distros import LinuxPolicy
 from sos.policies.init_systems import InitSystem
+from string import ascii_lowercase
 
 PATH = os.path.dirname(__file__)
 
@@ -25,8 +27,10 @@ def j(filename):
 
 
 def create_file(size, dir=None):
-    f = tempfile.NamedTemporaryFile(delete=False, dir=dir)
-    f.write(b"*" * size * 1024 * 1024)
+    f = tempfile.NamedTemporaryFile(delete=False, dir=dir, mode='w')
+    fsize = size * 1024 * 1024
+    content = ''.join(random.choice(ascii_lowercase) for x in range(fsize))
+    f.write(content)
     f.flush()
     f.close()
     return f.name
@@ -41,7 +45,7 @@ class MockArchive(TarFileArchive):
     def name(self):
         return "mock.archive"
 
-    def add_file(self, src, dest=None):
+    def add_file(self, src, dest=None, force=False):
         if not dest:
             dest = src
         self.m[src] = dest
@@ -292,7 +296,7 @@ class PluginTests(unittest.TestCase):
         })
         p.archive = MockArchive()
         p.setup()
-        p.collect()
+        p.collect_plugin()
         self.assertEquals(p.archive.m, {})
 
     def test_postproc_default_on(self):
@@ -304,6 +308,21 @@ class PluginTests(unittest.TestCase):
         })
         p.postproc()
         self.assertTrue(p.did_postproc)
+
+    def test_set_default_cmd_env(self):
+        p = MockPlugin({
+            'sysroot': self.sysroot,
+            'policy': LinuxPolicy(init=InitSystem(), probe_runtime=False),
+            'cmdlineopts': MockOptions(),
+            'devices': {}
+        })
+        e = {'TORVALDS': 'Linus'}
+        p.set_default_cmd_environment(e)
+        self.assertEquals(p.default_environment, e)
+        add_e = {'GREATESTSPORT': 'hockey'}
+        p.add_default_cmd_environment(add_e)
+        self.assertEquals(p.default_environment['GREATESTSPORT'], 'hockey')
+        self.assertEquals(p.default_environment['TORVALDS'], 'Linus')
 
 
 class AddCopySpecTests(unittest.TestCase):
@@ -339,10 +358,10 @@ class AddCopySpecTests(unittest.TestCase):
         self.mp.sysroot = '/'
         fn = create_file(2)  # create 2MB file, consider a context manager
         self.mp.add_copy_spec(fn, 1)
-        content, fname, _tags = self.mp.copy_strings[0]
-        self.assertTrue("tailed" in fname)
+        fname, _size = self.mp._tail_files_list[0]
+        self.assertTrue(fname == fn)
         self.assertTrue("tmp" in fname)
-        self.assertEquals(1024 * 1024, len(content))
+        self.assertEquals(1024 * 1024, _size)
         os.unlink(fn)
 
     def test_bad_filename(self):
@@ -369,10 +388,9 @@ class AddCopySpecTests(unittest.TestCase):
         create_file(2, dir=tmpdir)
         create_file(2, dir=tmpdir)
         self.mp.add_copy_spec(tmpdir + "/*", 1)
-        self.assertEquals(len(self.mp.copy_strings), 1)
-        content, fname, _tags = self.mp.copy_strings[0]
-        self.assertTrue("tailed" in fname)
-        self.assertEquals(1024 * 1024, len(content))
+        self.assertEquals(len(self.mp._tail_files_list), 1)
+        fname, _size = self.mp._tail_files_list[0]
+        self.assertEquals(1024 * 1024, _size)
         shutil.rmtree(tmpdir)
 
     def test_multiple_files_no_limit(self):
@@ -431,7 +449,7 @@ class RegexSubTests(unittest.TestCase):
     def test_no_replacements(self):
         self.mp.sysroot = '/'
         self.mp.add_copy_spec(j("tail_test.txt"))
-        self.mp.collect()
+        self.mp.collect_plugin()
         replacements = self.mp.do_file_sub(
             j("tail_test.txt"), r"wont_match", "foobar")
         self.assertEquals(0, replacements)
@@ -440,7 +458,7 @@ class RegexSubTests(unittest.TestCase):
         # test uses absolute paths
         self.mp.sysroot = '/'
         self.mp.add_copy_spec(j("tail_test.txt"))
-        self.mp.collect()
+        self.mp.collect_plugin()
         replacements = self.mp.do_file_sub(
             j("tail_test.txt"), r"(tail)", "foobar")
         self.assertEquals(1, replacements)

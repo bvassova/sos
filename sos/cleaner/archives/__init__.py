@@ -16,6 +16,7 @@ import tarfile
 import re
 
 from concurrent.futures import ProcessPoolExecutor
+from sos.utilities import file_is_binary
 
 
 # python older than 3.8 will hit a pickling error when we go to spawn a new
@@ -24,6 +25,12 @@ from concurrent.futures import ProcessPoolExecutor
 def extract_archive(archive_path, tmpdir):
     archive = tarfile.open(archive_path)
     path = os.path.join(tmpdir, 'cleaner')
+    # set extract filter since python 3.12 (see PEP-706 for more)
+    # Because python 3.10 and 3.11 raises false alarms as exceptions
+    # (see #3330 for examples), we can't use data filter but must
+    # fully trust the archive (legacy behaviour)
+    archive.extraction_filter = getattr(tarfile, 'fully_trusted_filter',
+                                        (lambda member, path: member))
     archive.extractall(path)
     archive.close()
     return os.path.join(path, archive.name.split('/')[-1].split('.tar')[0])
@@ -43,6 +50,7 @@ class SoSObfuscationArchive():
     type_name = 'undetermined'
     description = 'undetermined'
     is_nested = False
+    skip_files = []
     prep_files = {}
 
     def __init__(self, archive_path, tmpdir):
@@ -66,6 +74,14 @@ class SoSObfuscationArchive():
     def check_is_type(cls, arc_path):
         """Check if the archive is a well-known type we directly support"""
         return False
+
+    @property
+    def is_sos(self):
+        return 'sos' in self.__class__.__name__.lower()
+
+    @property
+    def is_insights(self):
+        return 'insights' in self.type_name
 
     def _load_self(self):
         if self.is_tarfile:
@@ -111,6 +127,7 @@ class SoSObfuscationArchive():
         Returns: list of files and file regexes
         """
         return [
+            'proc/kallsyms',
             'sosreport-',
             'sys/firmware',
             'sys/fs',
@@ -163,8 +180,12 @@ class SoSObfuscationArchive():
                 )
                 return ''
         else:
-            with open(self.format_file_name(fname), 'r') as to_read:
-                return to_read.read()
+            try:
+                with open(self.format_file_name(fname), 'r') as to_read:
+                    return to_read.read()
+            except Exception as err:
+                self.log_debug(f"Failed to get contents of {fname}: {err}")
+                return ''
 
     def extract(self, quiet=False):
         if self.is_tarfile:
@@ -285,18 +306,31 @@ class SoSObfuscationArchive():
             path = _path_future.result()
             return path
 
-    def get_file_list(self):
-        """Return a list of all files within the archive"""
-        self.file_list = []
+    def get_symlinks(self):
+        """Iterator for a list of symlinks in the archive"""
         for dirname, dirs, files in os.walk(self.extracted_path):
             for _dir in dirs:
                 _dirpath = os.path.join(dirname, _dir)
-                # catch dir-level symlinks
-                if os.path.islink(_dirpath) and os.path.isdir(_dirpath):
-                    self.file_list.append(_dirpath)
+                if os.path.islink(_dirpath):
+                    yield _dirpath
             for filename in files:
-                self.file_list.append(os.path.join(dirname, filename))
-        return self.file_list
+                _fname = os.path.join(dirname, filename)
+                if os.path.islink(_fname):
+                    yield _fname
+
+    def get_file_list(self):
+        """Iterator for a list of files in the archive, to allow clean to
+        iterate over.
+
+        Will not include symlinks, as those are handled separately
+        """
+        for dirname, dirs, files in os.walk(self.extracted_path):
+            for filename in files:
+                _fname = os.path.join(dirname, filename.lstrip('/'))
+                if os.path.islink(_fname):
+                    continue
+                else:
+                    yield _fname
 
     def get_directory_list(self):
         """Return a list of all directories within the archive"""
@@ -349,14 +383,14 @@ class SoSObfuscationArchive():
         :rtype:     ``bool``
         """
         obvious_removes = [
-            r'.*\.gz',  # TODO: support flat gz/xz extraction
-            r'.*\.xz',
-            r'.*\.bzip2',
+            r'.*\.gz$',  # TODO: support flat gz/xz extraction
+            r'.*\.xz$',
+            r'.*\.bzip2$',
             r'.*\.tar\..*',  # TODO: support archive unpacking
             r'.*\.txz$',
             r'.*\.tgz$',
-            r'.*\.bin',
-            r'.*\.journal',
+            r'.*\.bin$',
+            r'.*\.journal$',
             r'.*\~$'
         ]
 
@@ -366,28 +400,10 @@ class SoSObfuscationArchive():
             if re.match(_arc_reg, fname):
                 return True
 
-        if os.path.isfile(self.get_file_path(fname)):
-            return self.file_is_binary(fname)
+        _full_path = self.get_file_path(fname)
+        if os.path.isfile(_full_path):
+            return file_is_binary(_full_path)
         # don't fail on dir-level symlinks
         return False
-
-    def file_is_binary(self, fname):
-        """Determine if the file is a binary file or not.
-
-
-        :param fname:          Filename relative to the extracted archive root
-        :type fname:           ``str``
-
-        :returns:   ``True`` if file is binary, else ``False``
-        :rtype:     ``bool``
-        """
-        with open(self.get_file_path(fname), 'tr') as tfile:
-            try:
-                # when opened as above (tr), reading binary content will raise
-                # an exception
-                tfile.read(1)
-                return False
-            except UnicodeDecodeError:
-                return True
 
 # vim: set et ts=4 sw=4 :

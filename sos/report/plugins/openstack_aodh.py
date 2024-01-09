@@ -34,12 +34,12 @@ class OpenStackAodh(Plugin):
         if self.get_option("all_logs"):
             self.add_copy_spec([
                 "/var/log/aodh/*",
-                "/var/log/httpd/aodh*",
+                "/var/log/{}*/aodh*".format(self.apachepkg),
             ])
         else:
             self.add_copy_spec([
                 "/var/log/aodh/*.log",
-                "/var/log/httpd/aodh*.log",
+                "/var/log/{}*/aodh*.log".format(self.apachepkg),
             ])
 
         vars_all = [p in os.environ for p in [
@@ -61,45 +61,65 @@ class OpenStackAodh(Plugin):
                 "aodh alarm list"
             ])
 
+    def apply_regex_sub(self, regexp, subst):
+        self.do_path_regex_sub(
+            "/etc/aodh/aodh.conf",
+            regexp, subst
+        )
+        self.do_path_regex_sub(
+            self.var_puppet_gen + "/etc/aodh/aodh.conf",
+            regexp, subst
+        )
+
     def postproc(self):
-        self.do_file_sub(
-            "/etc/aodh/aodh.conf",
-            r"(password[\t\ ]*=[\t\ ]*)(.+)",
-            r"\1********"
-        )
+        protect_keys = [
+            "admin_password", "connection_password", "host_password",
+            "os_password", "password", "qpid_password", "rabbit_password",
+            "memcache_secret_key"
+        ]
+        connection_keys = ["connection", "backend_url", "transport_url"]
 
-        self.do_file_sub(
-            "/etc/aodh/aodh.conf",
-            r"(rabbit_password[\t\ ]*=[\t\ ]*)(.+)",
-            r"\1********",
+        self.apply_regex_sub(
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"\1*********"
         )
-
-        self.do_file_sub(
-            self.var_puppet_gen + "/etc/aodh/aodh.conf",
-            r"(password[\t\ ]*=[\t\ ]*)(.+)",
-            r"\1********"
-        )
-
-        self.do_file_sub(
-            self.var_puppet_gen + "/etc/aodh/aodh.conf",
-            r"(rabbit_password[\t\ ]*=[\t\ ]*)(.+)",
-            r"\1********",
+        self.apply_regex_sub(
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            "|".join(connection_keys),
+            r"\1*********\6"
         )
 
 
 class DebianOpenStackAodh(OpenStackAodh, DebianPlugin, UbuntuPlugin):
 
+    apachepkg = "apache2"
     packages = (
         'aodh-api',
+        'aodh-common',
         'aodh-evaluator',
         'aodh-notifier',
         'aodh-listener',
-        'python-aodhclient'
+        'python-aodh',
+        'python3-aodh',
     )
 
 
 class RedHatOpenStackAodh(OpenStackAodh, RedHatPlugin):
 
+    apachepkg = "httpd"
     packages = ('openstack-selinux',)
+
+    def setup(self):
+        super(RedHatOpenStackAodh, self).setup()
+        if self.get_option("all_logs"):
+            self.add_copy_spec([
+                "/var/log/containers/httpd/aodh-api/*",
+                "/var/log/containers/aodh/*"
+            ])
+        else:
+            self.add_copy_spec([
+                "/var/log/containers/httpd/aodh-api/*.log",
+                "/var/log/containers/aodh/*.log"
+            ])
 
 # vim: set et ts=4 sw=4 :

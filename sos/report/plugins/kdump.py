@@ -7,7 +7,8 @@
 # See the LICENSE file in the source distribution for further information.
 
 import platform
-from sos.report.plugins import Plugin, RedHatPlugin, DebianPlugin, UbuntuPlugin
+from sos.report.plugins import Plugin, PluginOpt, RedHatPlugin, DebianPlugin, \
+    UbuntuPlugin, CosPlugin
 
 
 class KDump(Plugin):
@@ -29,9 +30,11 @@ class KDump(Plugin):
             "/sys/kernel/fadump_registered",
             "/sys/kernel/fadump/registered",
             "/sys/kernel/fadump/mem_reserved",
-            "/sys/kernel/kexec_crash_loaded",
             "/sys/kernel/kexec_crash_size"
         ])
+
+        self.add_copy_spec("/sys/kernel/kexec_crash_loaded",
+                           tags="kexec_crash_loaded")
 
 
 class RedHatKDump(KDump, RedHatPlugin):
@@ -70,10 +73,11 @@ class RedHatKDump(KDump, RedHatPlugin):
         self.add_copy_spec([
             "/etc/kdump.conf",
             "/etc/udev/rules.d/*kexec.rules",
-            "/var/crash/*/vmcore-dmesg.txt",
             "/var/crash/*/kexec-dmesg.log",
             "/var/log/kdump.log"
         ])
+        self.add_copy_spec("/var/crash/*/vmcore-dmesg.txt",
+                           tags="vmcore_dmesg")
         try:
             path = self.read_kdump_conffile()
         except Exception:
@@ -101,5 +105,19 @@ class DebianKDump(KDump, DebianPlugin, UbuntuPlugin):
         self.add_copy_spec([
             "/etc/default/kdump-tools"
         ])
+
+
+class CosKDump(KDump, CosPlugin):
+
+    option_list = [
+        PluginOpt(name="collect-kdumps", default=False,
+                  desc="Collect existing kdump files"),
+    ]
+
+    def setup(self):
+        super(CosKDump, self).setup()
+        self.add_cmd_output('ls -alRh /var/kdump*')
+        if self.get_option("collect-kdumps"):
+            self.add_copy_spec(["/var/kdump-*"])
 
 # vim: set et ts=4 sw=4 :

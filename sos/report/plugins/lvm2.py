@@ -21,7 +21,9 @@ class Lvm2(Plugin, IndependentPlugin):
         PluginOpt('lvmdump', default=False, desc='collect an lvmdump tarball'),
         PluginOpt('lvmdump-am', default=False,
                   desc=('attempt to collect lvmdump with advanced options and '
-                        'raw metadata'))
+                        'raw metadata')),
+        PluginOpt('metadata', default=False,
+                  desc=('attempt to collect headers and metadata via pvck'))
     ]
 
     def do_lvmdump(self, metadata=False):
@@ -38,6 +40,24 @@ class Lvm2(Plugin, IndependentPlugin):
         cmd = lvmdump_cmd % (lvmdump_opts, lvmdump_path)
 
         self.add_cmd_output(cmd, chroot=self.tmp_in_sysroot())
+
+    def get_pvck_output(self):
+        """ Collects the output of the command pvck for each block device
+            present in the system.
+        """
+
+        block_list = self.exec_cmd(
+            'pvs -o pv_name --no-headings'
+        )
+        if block_list['status'] == 0:
+            for line in block_list['output'].splitlines():
+                cmds = [
+                    f"pvck --dump headers {line}",
+                    f"pvck --dump metadata {line}",
+                    f"pvck --dump metadata_all {line} -v",
+                    f"pvck --dump metadata_search {line} -v"
+                ]
+                self.add_cmd_output(cmds, subdir="metadata")
 
     def setup(self):
         # When running LVM2 comamnds:
@@ -63,7 +83,7 @@ class Lvm2(Plugin, IndependentPlugin):
 
         self.add_cmd_output(
             "vgdisplay -vv %s" % lvm_opts_foreign,
-            root_symlink="vgdisplay"
+            root_symlink="vgdisplay", tags="vgdisplay"
         )
 
         pvs_cols = 'pv_mda_free,pv_mda_size,pv_mda_count,pv_mda_used_count'
@@ -72,19 +92,27 @@ class Lvm2(Plugin, IndependentPlugin):
         vgs_cols = vgs_cols + ',' + 'vg_tags,systemid'
         lvs_cols = ('lv_tags,devices,lv_kernel_read_ahead,lv_read_ahead,'
                     'stripes,stripesize')
-        self.add_cmd_output([
-            "vgscan -vvv %s" % lvm_opts,
-            "pvscan -v %s" % lvm_opts,
+        self.add_cmd_output("lvs -a -o +%s %s" % (lvs_cols, lvm_opts_foreign),
+                            tags="lvs_headings")
+        self.add_cmd_output(
             "pvs -a -v -o +%s %s" % (pvs_cols, lvm_opts_foreign),
-            "vgs -v -o +%s %s" % (vgs_cols, lvm_opts_foreign),
-            "lvs -a -o +%s %s" % (lvs_cols, lvm_opts_foreign)
+            tags="pvs_headings")
+        self.add_cmd_output("vgs -v -o +%s %s" % (vgs_cols, lvm_opts_foreign),
+                            tags="vgs_headings")
+        self.add_cmd_output([
+            "pvscan -v %s" % lvm_opts,
+            "vgscan -vvv %s" % lvm_opts
         ])
 
         self.add_copy_spec("/etc/lvm")
+        self.add_copy_spec("/run/lvm")
 
         if self.get_option('lvmdump'):
             self.do_lvmdump()
         elif self.get_option('lvmdump-am'):
             self.do_lvmdump(metadata=True)
+
+        if self.get_option('metadata'):
+            self.get_pvck_output()
 
 # vim: set et ts=4 sw=4 :

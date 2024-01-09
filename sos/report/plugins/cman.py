@@ -21,9 +21,6 @@ class Cman(Plugin, RedHatPlugin):
 
     files = ("/etc/cluster/cluster.conf",)
 
-    debugfs_path = "/sys/kernel/debug"
-    _debugfs_cleanup = False
-
     def setup(self):
 
         self.add_copy_spec([
@@ -56,7 +53,7 @@ class Cman(Plugin, RedHatPlugin):
             self.do_file_sub(
                 cluster_conf,
                 r"(\s*\<fencedevice\s*.*\s*passwd\s*=\s*)\S+(\")",
-                r"\1%s" % ('"***"')
+                r'\1"***"'
             )
 
         self.do_path_regex_sub(

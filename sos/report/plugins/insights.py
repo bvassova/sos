@@ -10,19 +10,32 @@ from sos.report.plugins import Plugin, RedHatPlugin
 
 
 class RedHatInsights(Plugin, RedHatPlugin):
+    """Plugin to capture configuration and logging for the Red Hat Insights
+    client. Insights is used to provide ongoing analysis of systems for
+    proactive problem mitigation, with the client being one of the primary
+    sources of data for the service.
 
-    short_desc = 'Collect config and logs for Red Hat Insights'
+    This plugin will capture configuration information under
+    /etc/insighits-client, as well as logs from /var/log/insights-client. A
+    single connection test via the `insights-client` command is performed and
+    recorded as well for troubleshooting purposes.
+    """
+
+    short_desc = 'Red Hat Insights configuration and client'
     plugin_name = 'insights'
     packages = ('redhat-access-insights', 'insights-client')
     profiles = ('system', 'sysmgmt')
     config = (
         '/etc/insights-client/insights-client.conf',
         '/etc/insights-client/.registered',
+        '/etc/insights-client/tags.yaml',
+        '/etc/insights-client/malware-detection-config.yml',
         '/etc/redhat-access-insights/redhat-access-insights.conf'
     )
 
     def setup(self):
         self.add_copy_spec(self.config)
+        self.add_copy_spec('/var/lib/insights')
 
         # Legacy log file location
         self.add_copy_spec("/var/log/redhat-access-insights/*.log")
@@ -36,6 +49,9 @@ class RedHatInsights(Plugin, RedHatPlugin):
             "insights-client --test-connection --net-debug",
             timeout=30
         )
+
+        for _dir in ["/etc/rhsm", "/sys/kernel", "/var/lib/sss"]:
+            self.add_cmd_output(f"/bin/ls -lanR {_dir}", cmd_as_tag=True)
 
     def postproc(self):
         for conf in self.config:

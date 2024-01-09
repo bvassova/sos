@@ -23,11 +23,24 @@ class DebianPolicy(LinuxPolicy):
            + ":/usr/local/sbin:/usr/local/bin"
     sos_pkg_name = 'sosreport'
 
+    deb_versions = {
+        'squeeze':  6,
+        'wheezy':   7,
+        'jessie':   8,
+        'stretch':  9,
+        'buster':   10,
+        'bullseye': 11,
+        'bookworm': 12,
+        'trixie':   13,
+        'forky':    14,
+        }
+
     def __init__(self, sysroot=None, init=None, probe_runtime=True,
                  remote_exec=None):
         super(DebianPolicy, self).__init__(sysroot=sysroot, init=init,
-                                           probe_runtime=probe_runtime)
-        self.package_manager = DpkgPackageManager(chroot=sysroot,
+                                           probe_runtime=probe_runtime,
+                                           remote_exec=remote_exec)
+        self.package_manager = DpkgPackageManager(chroot=self.sysroot,
                                                   remote_exec=remote_exec)
         self.valid_subclasses += [DebianPlugin]
 
@@ -49,12 +62,15 @@ class DebianPolicy(LinuxPolicy):
 
     def dist_version(self):
         try:
-            with open('/etc/lsb-release', 'r') as fp:
-                rel_string = fp.read()
-                if "wheezy/sid" in rel_string:
-                    return 6
-                elif "jessie/sid" in rel_string:
-                    return 7
+            with open('/etc/os-release', 'r') as fp:
+                rel_string = ""
+                lines = fp.readlines()
+                for line in lines:
+                    if "VERSION_CODENAME" in line:
+                        rel_string = line.split("=")[1].strip()
+                        break
+                if rel_string in self.deb_versions:
+                    return self.deb_versions[rel_string]
             return False
         except IOError:
             return False

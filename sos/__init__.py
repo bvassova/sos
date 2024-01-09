@@ -14,7 +14,7 @@
 This module houses the i18n setup and message function. The default is to use
 gettext to internationalize messages.
 """
-__version__ = "4.2"
+__version__ = "4.6.0"
 
 import os
 import sys
@@ -59,9 +59,11 @@ class SoS():
         # if no aliases are desired, pass an empty list
         import sos.report
         import sos.cleaner
+        import sos.help
         self._components = {
             'report': (sos.report.SoSReport, ['rep']),
-            'clean': (sos.cleaner.SoSCleaner, ['cleaner', 'mask'])
+            'clean': (sos.cleaner.SoSCleaner, ['cleaner', 'mask']),
+            'help': (sos.help.SoSHelper, [])
         }
         # some distros do not want pexpect as a default dep, so try to load
         # collector here, and if it fails add an entry that implies it is at
@@ -157,6 +159,11 @@ class SoS():
 
         # Group to make tarball encryption (via GPG/password) exclusive
         encrypt_grp = global_grp.add_mutually_exclusive_group()
+        encrypt_grp.add_argument("--encrypt", default=False,
+                                 action="store_true",
+                                 help=("Encrypt the archive, either prompting "
+                                       "for a password/key or referencing "
+                                       "an environment variable"))
         encrypt_grp.add_argument("--encrypt-key",
                                  help="Encrypt the archive using a GPG "
                                       "key-pair")

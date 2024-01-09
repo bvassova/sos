@@ -20,11 +20,14 @@ class DockerContainerRuntime(ContainerRuntime):
 
     def check_is_active(self):
         # the daemon must be running
-        if (is_executable('docker') and
+        if (is_executable('docker', self.policy.sysroot) and
                 (self.policy.init_system.is_running('docker') or
                  self.policy.init_system.is_running('snap.docker.dockerd'))):
             self.active = True
             return True
         return False
+
+    def check_can_copy(self):
+        return self.active
 
 # vim: set et ts=4 sw=4 :

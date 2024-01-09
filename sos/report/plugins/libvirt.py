@@ -15,7 +15,7 @@ class Libvirt(Plugin, IndependentPlugin):
     short_desc = 'libvirt virtualization API'
 
     plugin_name = 'libvirt'
-    profiles = ('system', 'virt')
+    profiles = ('system', 'virt', 'openstack_edpm')
 
     def setup(self):
         libvirt_keytab = "/etc/libvirt/krb5.tab"
@@ -43,6 +43,9 @@ class Libvirt(Plugin, IndependentPlugin):
             "/etc/libvirt/qemu-lockd.conf",
             "/etc/libvirt/virtlockd.conf",
             "/var/lib/libvirt/dnsmasq/*",
+            "/var/lib/libvirt/qemu/snapshot/*/*.xml",
+            "/var/lib/openstack/config/libvirt",
+            "/var/lib/openstack/containers/libvirt*.json",
         ])
 
         if not self.get_option("all_logs"):
@@ -50,10 +53,22 @@ class Libvirt(Plugin, IndependentPlugin):
                 "/var/log/libvirt/libvirtd.log",
                 "/var/log/libvirt/qemu/*.log*",
                 "/var/log/libvirt/lxc/*.log",
-                "/var/log/libvirt/uml/*.log"
+                "/var/log/libvirt/uml/*.log",
+                "/var/log/swtpm/libvirt/qemu/*.log",
+                "/var/log/containers/libvirt/libvirtd.log",
+                "/var/log/containers/libvirt/qemu/*.log*",
+                "/var/log/containers/libvirt/lxc/*.log",
+                "/var/log/containers/libvirt/swtpm/libvirt/qemu/*.log",
+                "/var/log/containers/libvirt/uml/*.log",
+                "/var/log/containers/qemu/*.log",
+                "/var/log/containers/libvirt/*.log",
             ])
         else:
-            self.add_copy_spec("/var/log/libvirt")
+            self.add_copy_spec([
+                "/var/log/libvirt",
+                "/var/log/containers/qemu/",
+                "/var/log/containers/libvirt/",
+            ])
 
         if self.path_exists(self.path_join(libvirt_keytab)):
             self.add_cmd_output("klist -ket %s" % libvirt_keytab)
@@ -62,9 +77,15 @@ class Libvirt(Plugin, IndependentPlugin):
 
         # get details of processes of KVM hosts
         for pidfile in glob.glob("/run/libvirt/*/*.pid"):
-            pid = open(pidfile).read().splitlines()[0]
-            for pf in ["environ", "cgroup", "maps", "numa_maps", "limits"]:
-                self.add_copy_spec("/proc/%s/%s" % (pid, pf))
+            with open(pidfile, 'r') as pfile:
+                pid = pfile.read().splitlines()[0]
+                for pf in ["environ", "cgroup", "maps", "numa_maps", "limits"]:
+                    self.add_copy_spec("/proc/%s/%s" % (pid, pf))
+
+        self.add_file_tags({
+            "/run/libvirt/qemu/*.xml": "var_qemu_xml",
+            "/var/log/libvirt/qemu/*.log": "libvirtd_qemu_log"
+        })
 
     def postproc(self):
         match_exp = r"(\s*passwd=\s*')([^']*)('.*)"

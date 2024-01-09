@@ -72,6 +72,13 @@ class OpenStackGlance(Plugin):
             else:
                 self.add_cmd_output("openstack image list --long")
 
+        self.add_file_tags({
+            "/etc/glance/glance-api.conf": "glance_api_conf",
+            "/etc/glance/glance-cache.conf": "glance_cache_conf",
+            "/etc/glance/glance-registry.conf": "glance_registry_conf",
+            "/var/log/glance/api.log": "glance_api_log"
+        })
+
     def apply_regex_sub(self, regexp, subst):
         self.do_path_regex_sub("/etc/glance/*", regexp, subst)
         self.do_path_regex_sub(
@@ -83,16 +90,17 @@ class OpenStackGlance(Plugin):
         protect_keys = [
             "admin_password", "password", "qpid_password", "rabbit_password",
             "s3_store_secret_key", "ssl_key_password",
-            "vmware_server_password", "transport_url"
+            "vmware_server_password", "transport_url",
+            "memcache_secret_key"
         ]
         connection_keys = ["connection"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )
@@ -106,7 +114,8 @@ class DebianGlance(OpenStackGlance, DebianPlugin, UbuntuPlugin):
         'glance-client',
         'glance-common',
         'glance-registry',
-        'python-glance'
+        'python-glance',
+        'python3-glance',
     )
     service_name = 'glance-api.service'
 

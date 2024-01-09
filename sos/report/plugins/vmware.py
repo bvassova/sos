@@ -34,10 +34,15 @@ class VMWare(Plugin, RedHatPlugin):
             "/var/log/vmware-vmusr-root.log"
         ])
 
+        self.add_file_tags({
+            "/etc/vmware-tools/tools.conf": "vmware_tools_conf"
+        })
+
         self.add_cmd_output([
             "vmware-checkvm",
             "vmware-toolbox-cmd device list",
-            "vmware-toolbox-cmd -v"
+            "vmware-toolbox-cmd -v",
+            "vmware-toolbox-cmd timesync status"
         ])
 
         stats = self.exec_cmd("vmware-toolbox-cmd stat raw")

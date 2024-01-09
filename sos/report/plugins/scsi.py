@@ -11,6 +11,17 @@ from sos.report.plugins import Plugin, IndependentPlugin
 
 
 class Scsi(Plugin, IndependentPlugin):
+    """
+    Collects various information about the SCSI devices install on the host
+    system.
+
+    This plugin will capture a large amount of data from the /sys filesystem,
+    as well as several different invocations of the `lsscsi` command.
+
+    Additionally, several `sg_persist` commands will be collected for each
+    SCSI device identified by sos. Note that in most cases these commands are
+    provided by the `sg3_utils` package which may not be present by default.
+    """
 
     short_desc = 'SCSI devices'
 
@@ -28,7 +39,16 @@ class Scsi(Plugin, IndependentPlugin):
             "/sys/class/scsi_generic"
         ])
 
-        self.add_cmd_output("lsscsi -i", suggest_filename="lsscsi")
+        scsi_types = ["enclosu"]
+        result = self.collect_cmd_output('lsscsi -g')
+        if result['status'] == 0:
+            for line in result['output'].splitlines():
+                if (line.split()[1] in scsi_types):
+                    devsg = line.split()[-1]
+                    self.add_cmd_output("sg_ses -p2 -b1 %s" % devsg)
+
+        self.add_cmd_output("lsscsi -i", suggest_filename="lsscsi",
+                            tags="lsscsi")
 
         self.add_cmd_output([
             "sg_map -x",
@@ -36,14 +56,19 @@ class Scsi(Plugin, IndependentPlugin):
             "lsmap -all",
             "lsnports",
             "lsscsi -H",
-            "lsscsi -g",
             "lsscsi -d",
             "lsscsi -s",
             "lsscsi -L"
         ])
 
         scsi_hosts = glob("/sys/class/scsi_host/*")
-        self.add_blockdev_cmd("udevadm info -a %(dev)s", devices=scsi_hosts,
-                              prepend_path='/sys/class/scsi_host')
+        self.add_device_cmd("udevadm info -a %(dev)s", devices=scsi_hosts)
+
+        self.add_device_cmd([
+            "sg_persist --in -k -d %(dev)s",
+            "sg_persist --in -r -d %(dev)s",
+            "sg_persist --in -s -d %(dev)s",
+            "sg_inq %(dev)s"
+        ], devices='block', whitelist=['sd.*'])
 
 # vim: set et ts=4 sw=4 :

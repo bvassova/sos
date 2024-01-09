@@ -34,14 +34,16 @@ class RabbitMQ(Plugin, IndependentPlugin):
             for container in container_names:
                 self.add_container_logs(container)
                 self.add_cmd_output(
-                    self.fmt_container_cmd(container, 'rabbitmqctl report'),
-                    foreground=True
+                    'rabbitmqctl report',
+                    container=container,
+                    foreground=True,
+                    tags="rabbitmq_report"
                 )
                 self.add_cmd_output(
-                    self.fmt_container_cmd(
-                        container, "rabbitmqctl eval "
-                        "'rabbit_diagnostics:maybe_stuck().'"),
-                    foreground=True, timeout=10
+                    "rabbitmqctl eval 'rabbit_diagnostics:maybe_stuck().'",
+                    container=container,
+                    foreground=True,
+                    timeout=10
                 )
         else:
             self.add_cmd_output("rabbitmqctl report")
@@ -58,6 +60,11 @@ class RabbitMQ(Plugin, IndependentPlugin):
         self.add_copy_spec([
             "/var/log/rabbitmq/*",
         ])
+
+        self.add_file_tags({
+            "/var/log/rabbitmq/rabbit@.*[^-sasl].log": "rabbitmq_logs",
+            "/var/log/rabbitmq/startup_err": "rabbitmq_startup_err"
+        })
 
         # Crash dump can be large in some situation but it is useful to
         # investigate why rabbitmq crashes. So capture the file without

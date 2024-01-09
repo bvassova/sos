@@ -35,12 +35,14 @@ class SoSIPParser(SoSCleanerParser):
         'sos_commands/rpm',
         'sos_commands/yum/.*list.*',
         'sos_commands/snappy/snap_list_--all',
-        'sos_commands/snappy/snap_--version',
         'sos_commands/vulkan/vulkaninfo',
-        'var/log/.*dnf.*'
+        'var/log/.*dnf.*',
+        'var/log/.*packag.*',  # get 'packages' and 'packaging' logs
+        '.*(version|release)(\\.txt)?$',  # obvious version files
     ]
 
     map_file_key = 'ip_map'
+    compile_regexes = False
 
     def __init__(self, config):
         self.mapping = SoSIPMap()

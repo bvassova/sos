@@ -18,6 +18,7 @@ import time
 
 from argparse import SUPPRESS
 from datetime import datetime
+from getpass import getpass
 from shutil import rmtree
 from pathlib import Path
 from sos import __version__
@@ -50,6 +51,7 @@ class SoSComponent():
     arg_defaults = {}
     configure_logging = True
     load_policy = True
+    load_probe = True
     root_required = False
 
     _arg_defaults = {
@@ -57,6 +59,7 @@ class SoSComponent():
         "compression_type": 'auto',
         "config_file": '/etc/sos/sos.conf',
         "debug": False,
+        "encrypt": False,
         "encrypt_key": None,
         "encrypt_pass": None,
         "quiet": False,
@@ -82,7 +85,11 @@ class SoSComponent():
         except Exception:
             pass
 
-        # update args from component's arg_defaults defintion
+        self.opts = SoSOptions(arg_defaults=self._arg_defaults)
+        if self.load_policy:
+            self.load_local_policy()
+
+        # update args from component's arg_defaults definition
         self._arg_defaults.update(self.arg_defaults)
         self.opts = self.load_options()  # lgtm [py/init-calls-subclass]
 
@@ -105,15 +112,6 @@ class SoSComponent():
             self.tempfile_util = TempFileUtil(self.tmpdir)
             self._setup_logging()
 
-        if self.load_policy:
-            try:
-                import sos.policies
-                self.policy = sos.policies.load(sysroot=self.opts.sysroot)
-                self.sysroot = self.policy.host_sysroot()
-            except KeyboardInterrupt:
-                self._exit(0)
-            self._is_root = self.policy.is_root()
-
         if self.manifest is not None:
             self.manifest.add_field('version', __version__)
             self.manifest.add_field('cmdline', ' '.join(self.cmdline))
@@ -126,6 +124,16 @@ class SoSComponent():
             self.manifest.add_field('tmpdir_fs_type', self.tmpfstype)
             self.manifest.add_field('policy', self.policy.distro)
             self.manifest.add_section('components')
+
+    def load_local_policy(self):
+        try:
+            import sos.policies
+            self.policy = sos.policies.load(sysroot=self.opts.sysroot,
+                                            probe_runtime=self.load_probe)
+            self.sysroot = self.policy.sysroot
+        except KeyboardInterrupt:
+            self._exit(0)
+        self._is_root = self.policy.is_root()
 
     def execute(self):
         raise NotImplementedError
@@ -175,6 +183,7 @@ class SoSComponent():
         opts = [o for o in self.opts.dict().keys() if o.startswith('list')]
         if opts:
             return any([getattr(self.opts, opt) for opt in opts])
+        return False
 
     @classmethod
     def add_parser_options(cls, parser):
@@ -211,9 +220,21 @@ class SoSComponent():
         # set all values back to their normal default
         codict = cmdopts.dict(preset_filter=False)
         for opt, val in codict.items():
-            if opt not in cmdopts.arg_defaults.keys():
+            if opt not in cmdopts.arg_defaults.keys() or val in [None, [], '']:
                 continue
-            if val not in [None, [], ''] and val != opts.arg_defaults[opt]:
+            # A plugin that is [enabled|disabled|only] in cmdopts must
+            # overwrite these three options of itself in opts - reset it first
+            if opt in ["enable_plugins", "skip_plugins", "only_plugins"]:
+                for oopt in ["enable_plugins", "skip_plugins", "only_plugins"]:
+                    common = set(val) & set(getattr(opts, oopt))
+                    # common has all plugins that are in this combination of
+                    # "[-e|-o|-n] plug" of cmdopts & "[-e|-o|-n] plug" of opts
+                    # so remove those plugins from this [-e|-o|-n] opts
+                    if common:
+                        setattr(opts, oopt, [x for x in getattr(opts, oopt)
+                                if x not in common])
+
+            if val != opts.arg_defaults[opt]:
                 setattr(opts, opt, val)
 
         return opts
@@ -245,6 +266,28 @@ class SoSComponent():
 
         opts = self.apply_options_from_cmdline(opts)
 
+        # user specified command line preset
+        self.preset = None
+        if hasattr(opts, 'preset'):
+            if opts.preset != self._arg_defaults["preset"]:
+                self.preset = self.policy.find_preset(opts.preset)
+                if not self.preset:
+                    sys.stderr.write("Unknown preset: '%s'\n" % opts.preset)
+                    self.preset = self.policy.probe_preset()
+                    opts.list_presets = True
+
+            # --preset=auto
+            if not self.preset:
+                self.preset = self.policy.probe_preset()
+            # now merge preset options to opts
+            opts.merge(self.preset.opts)
+            # re-apply any cmdline overrides to the preset
+            opts = self.apply_options_from_cmdline(opts)
+
+            if hasattr(self.preset.opts, 'verbosity') and \
+                    self.preset.opts.verbosity > 0:
+                self.set_loggers_verbosity(self.preset.opts.verbosity)
+
         return opts
 
     def cleanup(self):
@@ -261,7 +304,45 @@ class SoSComponent():
             print("Failed to finish cleanup: %s\nContents may remain in %s"
                   % (err, self.tmpdir))
 
+    def _set_encrypt_from_env_vars(self):
+        msg = ('No encryption environment variables set, archive will not be '
+               'encrypted')
+        if os.environ.get('SOSENCRYPTKEY'):
+            self.opts.encrypt_key = os.environ.get('SOSENCRYPTKEY')
+            msg = 'Encryption key set via environment variable'
+        elif os.environ.get('SOSENCRYPTPASS'):
+            self.opts.encrypt_pass = os.environ.get('SOSENCRYPTPASS')
+            msg = 'Encryption passphrase set via environment variable'
+        self.soslog.info(msg)
+        self.ui_log.info(msg)
+
+    def _get_encryption_method(self):
+        if not self.opts.batch:
+            _enc = None
+            while _enc not in ('P', 'K', 'E', 'N'):
+                _enc = input((
+                    'Specify encryption method [P]assphrase, [K]ey, [E]nv '
+                    'vars, [N]o encryption: '
+                )).upper()
+            if _enc == 'P':
+                self.opts.encrypt_pass = getpass('Specify encryption '
+                                                 'passphrase: ')
+            elif _enc == 'K':
+                self.opts.encrypt_key = input('Specify encryption key: ')
+            elif _enc == 'E':
+                self._set_encrypt_from_env_vars()
+            else:
+                self.opts.encrypt_key = None
+                self.opts.encrypt_pass = None
+                self.soslog.info("User specified --encrypt, but chose no "
+                                 "encryption when prompted.")
+                self.ui_log.warning("Archive will not be encrypted")
+        else:
+            self._set_encrypt_from_env_vars()
+
     def setup_archive(self, name=''):
+        if self.opts.encrypt:
+            self._get_encryption_method()
         enc_opts = {
             'encrypt': True if (self.opts.encrypt_pass or
                                 self.opts.encrypt_key) else False,
@@ -286,6 +367,25 @@ class SoSComponent():
 
         self.archive.set_debug(self.opts.verbosity > 2)
 
+    def add_ui_log_to_stdout(self):
+        ui_console = logging.StreamHandler(sys.stdout)
+        ui_console.setFormatter(logging.Formatter('%(message)s'))
+        ui_console.setLevel(
+            logging.DEBUG if self.opts.verbosity > 1 else logging.INFO
+        )
+        self.ui_log.addHandler(ui_console)
+
+    def set_loggers_verbosity(self, verbosity):
+        if verbosity:
+            if self.flog:
+                self.flog.setLevel(logging.DEBUG)
+            if self.opts.verbosity > 1:
+                self.console.setLevel(logging.DEBUG)
+            else:
+                self.console.setLevel(logging.WARNING)
+        else:
+            self.console.setLevel(logging.WARNING)
+
     def _setup_logging(self):
         """Creates the log handler that shall be used by all components and any
         and all related bits to those components that need to log either to the
@@ -294,29 +394,20 @@ class SoSComponent():
         # main soslog
         self.soslog = logging.getLogger('sos')
         self.soslog.setLevel(logging.DEBUG)
-        flog = None
+        self.flog = None
         if not self.check_listing_options():
             self.sos_log_file = self.get_temp_file()
-            flog = logging.StreamHandler(self.sos_log_file)
-            flog.setFormatter(logging.Formatter(
+            self.flog = logging.StreamHandler(self.sos_log_file)
+            self.flog.setFormatter(logging.Formatter(
                 '%(asctime)s %(levelname)s: %(message)s'))
-            flog.setLevel(logging.INFO)
-            self.soslog.addHandler(flog)
+            self.flog.setLevel(logging.INFO)
+            self.soslog.addHandler(self.flog)
 
         if not self.opts.quiet:
-            console = logging.StreamHandler(sys.stdout)
-            console.setFormatter(logging.Formatter('%(message)s'))
-            if self.opts.verbosity and self.opts.verbosity > 1:
-                console.setLevel(logging.DEBUG)
-                if flog:
-                    flog.setLevel(logging.DEBUG)
-            elif self.opts.verbosity and self.opts.verbosity > 0:
-                console.setLevel(logging.WARNING)
-                if flog:
-                    flog.setLevel(logging.DEBUG)
-            else:
-                console.setLevel(logging.WARNING)
-            self.soslog.addHandler(console)
+            self.console = logging.StreamHandler(sys.stdout)
+            self.console.setFormatter(logging.Formatter('%(message)s'))
+            self.set_loggers_verbosity(self.opts.verbosity)
+            self.soslog.addHandler(self.console)
         # still log ERROR level message to console, but only setup this handler
         # when --quiet is used, as otherwise we'll double log
         else:
@@ -327,7 +418,9 @@ class SoSComponent():
 
         # ui log
         self.ui_log = logging.getLogger('sos_ui')
-        self.ui_log.setLevel(logging.INFO)
+        self.ui_log.setLevel(
+            logging.DEBUG if self.opts.verbosity > 1 else logging.INFO
+        )
         if not self.check_listing_options():
             self.sos_ui_log_file = self.get_temp_file()
             ui_fhandler = logging.StreamHandler(self.sos_ui_log_file)
@@ -337,10 +430,7 @@ class SoSComponent():
             self.ui_log.addHandler(ui_fhandler)
 
         if not self.opts.quiet:
-            ui_console = logging.StreamHandler(sys.stdout)
-            ui_console.setFormatter(logging.Formatter('%(message)s'))
-            ui_console.setLevel(logging.INFO)
-            self.ui_log.addHandler(ui_console)
+            self.add_ui_log_to_stdout()
 
     def get_temp_file(self):
         return self.tempfile_util.new()
@@ -355,16 +445,32 @@ class SoSMetadata():
     metadata
     """
 
+    def __init__(self):
+        self._values = {}
+
+    def __iter__(self):
+        for item in self._values.items():
+            yield item[1]
+
+    def __getitem__(self, item):
+        return self._values[item]
+
+    def __getattr__(self, attr):
+        try:
+            return self._values[attr]
+        except Exception:
+            raise AttributeError(attr)
+
     def add_field(self, field_name, content):
         """Add a key, value entry to the current metadata instance
         """
-        setattr(self, field_name, content)
+        self._values[field_name] = content
 
     def add_section(self, section_name):
         """Adds a new instance of SoSMetadata to the current instance
         """
-        setattr(self, section_name, SoSMetadata())
-        return getattr(self, section_name)
+        self._values[section_name] = SoSMetadata()
+        return self._values[section_name]
 
     def add_list(self, list_name, content=[]):
         """Add a named list element to the current instance. If content is not
@@ -372,7 +478,7 @@ class SoSMetadata():
         """
         if not isinstance(content, list):
             raise TypeError('content added must be list')
-        setattr(self, list_name, content)
+        self._values[list_name] = content
 
     def get_json(self, indent=None):
         """Convert contents of this SoSMetdata instance, and all other nested
@@ -381,7 +487,7 @@ class SoSMetadata():
         Used to write manifest.json to the final archives.
         """
         return json.dumps(self,
-                          default=lambda o: getattr(o, '__dict__', str(o)),
+                          default=lambda o: getattr(o, '_values', str(o)),
                           indent=indent)
 
 # vim: set et ts=4 sw=4 :

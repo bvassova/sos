@@ -21,6 +21,8 @@ class Hardware(Plugin, IndependentPlugin):
         self.add_copy_spec("/proc/interrupts", tags='interrupts')
 
         self.add_copy_spec([
+            "/proc/device-tree/compatible",
+            "/proc/device-tree/model",
             "/proc/irq",
             "/proc/dma",
             "/proc/devices",
@@ -30,7 +32,8 @@ class Hardware(Plugin, IndependentPlugin):
             "/sys/class/drm/*/edid"
         ])
 
-        self.add_cmd_output("dmidecode", root_symlink="dmidecode")
+        self.add_cmd_output("dmidecode", root_symlink="dmidecode",
+                            tags="dmidecode")
         self.add_cmd_output("lshw")
 
 

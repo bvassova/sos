@@ -25,6 +25,8 @@ class ForemanInstaller(Plugin, DebianPlugin, UbuntuPlugin):
             "/etc/foreman-installer/*",
             "/var/log/foreman-installer/*",
             "/var/log/foreman-maintain/*",
+            "/var/lib/foreman-maintain/data.yml",
+            "/etc/foreman-maintain/foreman_maintain.yml",
             # specifically collect .applied files
             # that would be skipped otherwise as hidden files
             "/etc/foreman-installer/scenarios.d/*/.applied",
@@ -54,8 +56,8 @@ class ForemanInstaller(Plugin, DebianPlugin, UbuntuPlugin):
         # also hide passwords in yet different formats
         self.do_path_regex_sub(
             install_logs,
-            r"(\.|_|-)password(=\'|=|\", \")(\w*)",
-            r"\1password\2********")
+            r"((\.|_|-)password(=\'|=|\", \"))(\w*)",
+            r"\1********")
         self.do_path_regex_sub(
             "/var/log/foreman-installer/foreman-proxy*",
             r"(\s*proxy_password\s=) (.*)",
@@ -86,10 +88,10 @@ class RedHatForemanInstaller(ForemanInstaller, RedHatPlugin):
     def setup(self):
 
         self.add_file_tags({
-            '/var/log/foreman-installer/satellite.log.*':
-                ['insights_satellite_log' 'satellite_installer_log'],
-            '/var/log/foreman-installer/capsule.log.*':
-                ['insights_capsule_log' 'capsule_installer_log'],
+            '/var/log/foreman-installer/satellite.log':
+                ['foreman_satellite_log' 'satellite_installer_log'],
+            '/var/log/foreman-installer/capsule.log':
+                ['capsule_log' 'capsule_installer_log'],
         })
 
         super(RedHatForemanInstaller, self).setup()

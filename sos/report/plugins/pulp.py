@@ -45,7 +45,9 @@ class Pulp(Plugin, RedHatPlugin):
         self.messaging_cert_file = ""
         in_messaging_section = False
         try:
-            for line in open("/etc/pulp/server.conf").read().splitlines():
+            with open("/etc/pulp/server.conf", 'r') as pfile:
+                pulp_lines = pfile.read().splitlines()
+            for line in pulp_lines:
                 if match(r"^\s*seeds:\s+\S+:\S+", line):
                     uri = line.split()[1].split(',')[0].split(':')
                     self.dbhost = uri[0]
@@ -131,10 +133,13 @@ class Pulp(Plugin, RedHatPlugin):
         self.add_cmd_output(prun, suggest_filename="pulp-running_tasks")
         self.add_cmd_output(csizes, suggest_filename="mongo-collection_sizes")
         self.add_cmd_output(dbstats, suggest_filename="mongo-db_stats")
-        self.add_cmd_output([
-            "qpid-stat -%s --ssl-certificate=%s -b amqps://localhost:5671" %
-            (opt, self.messaging_cert_file) for opt in "quc"
-        ])
+
+        for opt in "quc":
+            self.add_cmd_output(
+                f"qpid-stat -{opt} --ssl-certificate="
+                f"{self.messaging_cert_file} -b amqps://localhost:5671",
+                tags=f"qpid_stat_{opt}")
+
         self.add_cmd_output(
             "sudo -u pulp PULP_SETTINGS='/etc/pulp/settings.py' "
             "DJANGO_SETTINGS_MODULE='pulpcore.app.settings' dynaconf list",
@@ -165,10 +170,13 @@ class Pulp(Plugin, RedHatPlugin):
         repl = r"\1********"
         self.do_path_regex_sub("/etc/pulp(.*)(.json$)", jreg, repl)
 
-        # obfuscate SECRET_KEY = .. and 'PASSWORD': .. in dynaconf list output
-        # and also in settings.py
+        # obfuscate SECRET_KEY = .., 'PASSWORD': ..,
+        # and AUTH_LDAP_BIND_PASSWORD = ..
+        # in dynaconf list output and also in settings.py
         # count with option that PASSWORD is with(out) quotes or in capitals
-        key_pass_re = r"(SECRET_KEY\s*=|(password|PASSWORD)(\"|'|:)+)\s*(\S*)"
+        key_pass_re = r"((?:SECRET_KEY|AUTH_LDAP_BIND_PASSWORD)" \
+                      r"(?:\<.+\>)?(\s*=)?|(password|PASSWORD)" \
+                      r"(\"|'|:)+)\s*(\S*)"
         repl = r"\1 ********"
         self.do_path_regex_sub("/etc/pulp/settings.py", key_pass_re, repl)
         self.do_cmd_output_sub("dynaconf list", key_pass_re, repl)

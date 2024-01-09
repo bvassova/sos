@@ -8,6 +8,7 @@
 
 from sos.report.plugins import (Plugin, RedHatPlugin, DebianPlugin,
                                 UbuntuPlugin, PluginOpt)
+from sos.utilities import parse_version
 from datetime import datetime, timedelta
 import re
 
@@ -42,16 +43,26 @@ class Pacemaker(Plugin):
         ])
 
     def setup_pcs(self):
+        pcs_pkg = self.policy.package_manager.pkg_by_name('pcs')
+        if pcs_pkg is None:
+            return
+
         self.add_copy_spec("/var/log/pcsd/pcsd.log")
         self.add_cmd_output([
-            "pcs config",
-            "pcs status --full",
             "pcs stonith sbd status --full",
             "pcs stonith sbd watchdog list",
             "pcs stonith history show",
-            "pcs quorum status",
-            "pcs property list --all"
         ])
+
+        pcs_version = '.'.join(pcs_pkg['version'])
+        if parse_version(pcs_version) > parse_version('0.10.8'):
+            self.add_cmd_output("pcs property config --all")
+        else:
+            self.add_cmd_output("pcs property list --all")
+
+        self.add_cmd_output("pcs config", tags="pcs_config")
+        self.add_cmd_output("pcs quorum status", tags="pcs_quorum_status")
+        self.add_cmd_output("pcs status --full", tags="pcs_status")
 
     def postproc_crm_shell(self):
         self.do_cmd_output_sub(
@@ -70,15 +81,16 @@ class Pacemaker(Plugin):
     def setup(self):
         self.add_copy_spec([
             # Pacemaker 2.x default log locations
-            "/var/log/pacemaker/pacemaker.log",
+            "/var/log/pacemaker/pacemaker.log*",
             "/var/log/pacemaker/bundles/*/",
+            "/var/log/pacemaker/pengine*",
 
             # Pacemaker 1.x default log locations
             "/var/log/pacemaker.log",
             "/var/log/pacemaker/bundles/*/",
 
             # Common user-specified locations
-            "/var/log/cluster/pacemaker.log",
+            "/var/log/cluster/pacemaker.log*",
             "/var/log/cluster/bundles/*/",
         ])
 

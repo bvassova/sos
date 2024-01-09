@@ -18,6 +18,16 @@ def _is_seq(val):
     return val_type is list or val_type is tuple
 
 
+def str_to_bool(val):
+    _val = val.lower()
+    if _val in ['true', 'on', 'yes']:
+        return True
+    elif _val in ['false', 'off', 'no']:
+        return False
+    else:
+        return None
+
+
 class SoSOptions():
 
     def _merge_opt(self, opt, src, is_default):
@@ -153,15 +163,13 @@ class SoSOptions():
         if isinstance(self.arg_defaults[key], list):
             return [v for v in val.split(',')]
         if isinstance(self.arg_defaults[key], bool):
-            _val = val.lower()
-            if _val in ['true', 'on', 'yes']:
-                return True
-            elif _val in ['false', 'off', 'no']:
-                return False
-            else:
+            val = str_to_bool(val)
+            if val is None:
                 raise Exception(
                     "Value of '%s' in %s must be True or False or analagous"
                     % (key, conf))
+            else:
+                return val
         if isinstance(self.arg_defaults[key], int):
             try:
                 return int(val)
@@ -200,7 +208,10 @@ class SoSOptions():
                         odict[rename_opts[key]] = odict.pop(key)
                 # set the values according to the config file
                 for key, val in odict.items():
-                    if isinstance(val, str):
+                    # most option values do not tolerate spaces, special
+                    # exception however for --keywords which we do want to
+                    # support phrases, and thus spaces, for
+                    if isinstance(val, str) and key != 'keywords':
                         val = val.replace(' ', '')
                     if key not in self.arg_defaults:
                         # read an option that is not loaded by the current
@@ -215,7 +226,7 @@ class SoSOptions():
         try:
             try:
                 with open(config_file) as f:
-                    config.readfp(f)
+                    config.read_file(f, config_file)
             except DuplicateOptionError as err:
                 raise exit("Duplicate option '%s' in section '%s' in file %s"
                            % (err.option, err.section, config_file))

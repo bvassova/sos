@@ -44,10 +44,12 @@ class OpenStackKeystone(Plugin):
         if self.get_option("all_logs"):
             self.add_copy_spec([
                 "/var/log/keystone/",
+                "/var/log/{}*/keystone*".format(self.apachepkg),
             ])
         else:
             self.add_copy_spec([
                 "/var/log/keystone/*.log",
+                "/var/log/{}*/keystone*.log".format(self.apachepkg),
             ])
 
         # collect domain config directory, if specified
@@ -57,7 +59,7 @@ class OpenStackKeystone(Plugin):
                 "identity domain_config_dir")
         self.domain_config_dir = exec_out['output']
         if exec_out['status'] != 0 or \
-                not(self.path_isdir(self.domain_config_dir)):
+                not (self.path_isdir(self.domain_config_dir)):
             self.domain_config_dir = "/etc/keystone/domains"
         self.add_copy_spec(self.domain_config_dir)
 
@@ -75,6 +77,11 @@ class OpenStackKeystone(Plugin):
             self.add_cmd_output("openstack endpoint list")
             self.add_cmd_output("openstack catalog list")
 
+        self.add_file_tags({
+            ".*/etc/keystone/keystone.conf": "keystone_conf",
+            "/var/log/keystone/keystone.log": "keystone_log"
+        })
+
     def apply_regex_sub(self, regexp, subst):
         self.do_path_regex_sub("/etc/keystone/*", regexp, subst)
         self.do_path_regex_sub(
@@ -91,39 +98,37 @@ class OpenStackKeystone(Plugin):
         connection_keys = ["connection"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )
 
         # obfuscate LDAP plaintext passwords in domain config dir
-        self.do_path_regex_sub(self.domain_config_dir,
-                               r"((?m)^\s*(%s)\s*=\s*)(.*)", r"\1********")
+        self.do_path_regex_sub(
+            self.domain_config_dir,
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"\1********"
+        )
 
 
 class DebianKeystone(OpenStackKeystone, DebianPlugin, UbuntuPlugin):
 
+    apachepkg = 'apache2'
     packages = (
         'keystone',
         'python-keystone',
-        'python-keystoneclient'
+        'python3-keystone',
     )
 
 
 class RedHatKeystone(OpenStackKeystone, RedHatPlugin):
 
+    apachepkg = 'httpd'
     packages = ('openstack-selinux',)
-
-    def setup(self):
-        super(RedHatKeystone, self).setup()
-        if self.get_option("all_logs"):
-            self.add_copy_spec("/var/log/httpd/keystone*")
-        else:
-            self.add_copy_spec("/var/log/httpd/keystone*.log")
 
 
 # vim: set et ts=4 sw=4 :

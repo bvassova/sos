@@ -30,7 +30,9 @@ class Candlepin(Plugin, RedHatPlugin):
         self.dbpasswd = ""
         cfg_file = "/etc/candlepin/candlepin.conf"
         try:
-            for line in open(cfg_file).read().splitlines():
+            with open(cfg_file, 'r') as cfile:
+                candle_lines = cfile.read().splitlines()
+            for line in candle_lines:
                 # skip empty lines and lines with comments
                 if not line or line[0] == '#':
                     continue
@@ -82,21 +84,29 @@ class Candlepin(Plugin, RedHatPlugin):
 
         self.add_cmd_output("du -sh /var/lib/candlepin/*/*")
         # collect tables sizes, ordered
-        _cmd = self.build_query_cmd("\
-            SELECT schema_name, relname, \
-                   pg_size_pretty(table_size) AS size, table_size \
-            FROM ( \
-              SELECT \
-                pg_catalog.pg_namespace.nspname AS schema_name, \
-                relname, \
-                pg_relation_size(pg_catalog.pg_class.oid) AS table_size \
-              FROM pg_catalog.pg_class \
-              JOIN pg_catalog.pg_namespace \
-                ON relnamespace = pg_catalog.pg_namespace.oid \
-            ) t \
-            WHERE schema_name NOT LIKE 'pg_%' \
-            ORDER BY table_size DESC;")
+        _cmd = self.build_query_cmd(
+            "SELECT table_name, pg_size_pretty(total_bytes) AS total, "
+            "pg_size_pretty(index_bytes) AS INDEX , "
+            "pg_size_pretty(toast_bytes) AS toast, pg_size_pretty(table_bytes)"
+            " AS TABLE FROM ( SELECT *, "
+            "total_bytes-index_bytes-COALESCE(toast_bytes,0) AS table_bytes "
+            "FROM (SELECT c.oid,nspname AS table_schema, relname AS "
+            "TABLE_NAME, c.reltuples AS row_estimate, "
+            "pg_total_relation_size(c.oid) AS total_bytes, "
+            "pg_indexes_size(c.oid) AS index_bytes, "
+            "pg_total_relation_size(reltoastrelid) AS toast_bytes "
+            "FROM pg_class c LEFT JOIN pg_namespace n ON "
+            "n.oid = c.relnamespace WHERE relkind = 'r') a) a order by "
+            "total_bytes DESC"
+        )
         self.add_cmd_output(_cmd, suggest_filename='candlepin_db_tables_sizes',
+                            env=self.env)
+
+        _cmd = self.build_query_cmd("\
+            SELECT displayname, content_access_mode \
+            FROM cp_owner;")
+        self.add_cmd_output(_cmd,
+                            suggest_filename='simple_content_access',
                             env=self.env)
 
     def build_query_cmd(self, query, csv=False):
@@ -120,7 +130,7 @@ class Candlepin(Plugin, RedHatPlugin):
         self.do_file_sub("/var/log/candlepin/cpdb.log", cpdbreg, repl)
         for key in ["trustStorePassword", "keyStorePassword"]:
             self.do_file_sub("/etc/candlepin/broker.xml",
-                             r"%s=(\w*)([;<])" % key,
-                             r"%s=********\2" % key)
+                             r"(%s)=(\w*)([;<])" % key,
+                             r"\1=********\3")
 
 # vim: set et ts=4 sw=4 :

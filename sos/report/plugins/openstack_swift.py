@@ -40,6 +40,11 @@ class OpenStackSwift(Plugin):
             self.var_puppet_gen + "/memcached/etc/sysconfig/memcached"
         ])
 
+        self.add_file_tags({
+            "/etc/swift/swift.conf": "swift_conf",
+            "/var/log/swift/swift.log": "swift_log"
+        })
+
     def apply_regex_sub(self, regexp, subst):
         self.do_path_regex_sub(r"/etc/swift/.*\.conf.*", regexp, subst)
         self.do_path_regex_sub(
@@ -57,11 +62,11 @@ class OpenStackSwift(Plugin):
         connection_keys = ["connection", "sql_connection"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )
@@ -77,7 +82,8 @@ class DebianSwift(OpenStackSwift, DebianPlugin, UbuntuPlugin):
         'swift-proxy',
         'swauth',
         'python-swift',
-        'python-swauth'
+        'python-swauth',
+        'python3-swift',
     )
 
 

@@ -9,6 +9,10 @@
 from sos.report.plugins import UbuntuPlugin
 from sos.policies.distros.debian import DebianPolicy
 
+from sos.policies.package_managers.snap import SnapPackageManager
+from sos.policies.package_managers.dpkg import DpkgPackageManager
+from sos.policies.package_managers import MultiPackageManager
+
 import os
 
 
@@ -31,6 +35,17 @@ class UbuntuPolicy(DebianPolicy):
         super(UbuntuPolicy, self).__init__(sysroot=sysroot, init=init,
                                            probe_runtime=probe_runtime,
                                            remote_exec=remote_exec)
+
+        self.package_manager = MultiPackageManager(
+            primary=DpkgPackageManager,
+            fallbacks=[SnapPackageManager],
+            chroot=self.sysroot,
+            remote_exec=remote_exec)
+
+        if self.package_manager.pkg_by_name(
+                'sosreport')['pkg_manager'] == 'snap':
+            self.sos_bin_path = '/snap/bin'
+
         self.valid_subclasses += [UbuntuPlugin]
 
     @classmethod
@@ -55,9 +70,9 @@ class UbuntuPolicy(DebianPolicy):
                 lines = fp.readlines()
                 for line in lines:
                     if "DISTRIB_RELEASE" in line:
-                        return line.split("=")[1].strip()
+                        return int(line.split("=")[1].strip())
             return False
-        except IOError:
+        except (IOError, ValueError):
             return False
 
     def get_upload_https_auth(self):
@@ -78,6 +93,6 @@ class UbuntuPolicy(DebianPolicy):
                 return self._upload_url
             fname = os.path.basename(self.upload_archive_name)
             return self._upload_url + fname
-        super(UbuntuPolicy, self).get_upload_url()
+        return super(UbuntuPolicy, self).get_upload_url()
 
 # vim: set et ts=4 sw=4 :

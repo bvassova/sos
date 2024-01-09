@@ -165,6 +165,15 @@ class Ovirt(Plugin, RedHatPlugin):
             "/var/lib/ovirt-engine-reports/jboss_runtime/config"
         ])
 
+        self.add_file_tags({
+            "/etc/ovirt-engine/engine.conf.d/.*":
+                "ovirt_engine_confd",
+            "/var/log/ovirt-engine/boot.log":
+                "ovirt_engine_boot_log",
+            "/var/log/ovirt-engine/console.log":
+                "ovirt_engine_console_log"
+        })
+
         # Copying host certs; extra copy the hidden .truststore file
         self.add_forbidden_path([
             "/etc/pki/ovirt-engine/keys",
@@ -179,16 +188,13 @@ class Ovirt(Plugin, RedHatPlugin):
         """
         Obfuscate sensitive keys.
         """
-        self.do_file_sub(
-            "/etc/ovirt-engine/engine-config/engine-config.properties",
-            r"Password.type=(.*)",
-            r"Password.type=********"
-        )
-        self.do_file_sub(
-            "/etc/rhevm/rhevm-config/rhevm-config.properties",
-            r"Password.type=(.*)",
-            r"Password.type=********"
-        )
+        for f in ["/etc/ovirt-engine/engine-config/engine-config.properties",
+                  "/etc/rhevm/rhevm-config/rhevm-config.properties"]:
+            self.do_file_sub(
+                f,
+                r"(Password.type)=(.*)",
+                r"\1=********"
+            )
 
         engine_files = (
             'ovirt-engine.xml',
@@ -200,14 +206,14 @@ class Ovirt(Plugin, RedHatPlugin):
         for filename in engine_files:
             self.do_file_sub(
                 "/var/tmp/ovirt-engine/config/%s" % filename,
-                r"<password>(.*)</password>",
-                r"<password>********</password>"
+                r"(<password>)(.*)(</password>)",
+                r"\1********\3"
             )
 
         self.do_file_sub(
             "/etc/ovirt-engine/redhatsupportplugin.conf",
-            r"proxyPassword=(.*)",
-            r"proxyPassword=********"
+            r"(proxyPassword)=(.*)",
+            r"\1=********"
         )
 
         passwd_files = [
@@ -219,13 +225,8 @@ class Ovirt(Plugin, RedHatPlugin):
             conf_path = self.path_join("/etc/ovirt-engine", conf_file)
             self.do_file_sub(
                 conf_path,
-                r"passwd=(.*)",
-                r"passwd=********"
-            )
-            self.do_file_sub(
-                conf_path,
-                r"pg-pass=(.*)",
-                r"pg-pass=********"
+                r"(passwd|pg-pass)=(.*)",
+                r"\1=********"
             )
 
         sensitive_keys = self.DEFAULT_SENSITIVE_KEYS
@@ -234,26 +235,25 @@ class Ovirt(Plugin, RedHatPlugin):
         if keys_opt and keys_opt is not True:
             sensitive_keys = keys_opt
         key_list = [x for x in sensitive_keys.split(':') if x]
-        for key in key_list:
-            self.do_path_regex_sub(
-                self.DB_PASS_FILES,
-                r'{key}=(.*)'.format(key=key),
-                r'{key}=********'.format(key=key)
-            )
+        self.do_path_regex_sub(
+            self.DB_PASS_FILES,
+            r'(%s)=(.*)' % "|".join(key_list),
+            r'\1=********'
+        )
 
-        # Answer files contain passwords
-        for key in (
-            'OVESETUP_CONFIG/adminPassword',
-            'OVESETUP_CONFIG/remoteEngineHostRootPassword',
-            'OVESETUP_DWH_DB/password',
-            'OVESETUP_DB/password',
-            'OVESETUP_REPORTS_CONFIG/adminPassword',
-            'OVESETUP_REPORTS_DB/password',
+        # Answer files contain passwords.
+        # Replace all keys that have 'password' in them, instead of hard-coding
+        # here the list of keys, which changes between versions.
+        # Sadly, the engine admin password prompt name does not contain
+        # 'password'... so neither does the env key.
+        for item in (
+            'password',
+            'OVESETUP_CONFIG_ADMIN_SETUP',
         ):
             self.do_path_regex_sub(
                 r'/var/lib/ovirt-engine/setup/answers/.*',
-                r'{key}=(.*)'.format(key=key),
-                r'{key}=********'.format(key=key)
+                r'(?P<key>[^=]*{item}[^=]*)=.*'.format(item=item),
+                r'\g<key>=********'
             )
 
         # aaa profiles contain passwords
@@ -263,7 +263,7 @@ class Ovirt(Plugin, RedHatPlugin):
             "pool.default.ssl.truststore.password",
             "config.datasource.dbpassword"
         ]
-        regexp = r"((?m)^\s*#*(%s)\s*=\s*)(.*)" % "|".join(protect_keys)
+        regexp = r"(^\s*#*(%s)\s*=\s*)(.*)" % "|".join(protect_keys)
 
         self.do_path_regex_sub(r"/etc/ovirt-engine/aaa/.*\.properties", regexp,
                                r"\1*********")

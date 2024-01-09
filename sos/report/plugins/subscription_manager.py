@@ -57,16 +57,20 @@ class SubscriptionManager(Plugin, RedHatPlugin):
             "/var/lib/rhsm/",
             "/var/log/rhsm/rhsm.log",
             "/var/log/rhsm/rhsmcertd.log"])
+        self.add_cmd_output("subscription-manager identity",
+                            tags="subscription_manager_id")
+        self.add_cmd_output("subscription-manager list --consumed",
+                            tags="subscription_manager_list_consumed")
+        self.add_cmd_output("subscription-manager list --installed",
+                            tags="subscription_manager_installed")
         self.add_cmd_output([
-            "subscription-manager list --installed",
             "subscription-manager list --available",
             "subscription-manager list --all --available",
-            "subscription-manager list --consumed",
-            "subscription-manager identity",
             "subscription-manager release --show",
             "subscription-manager release --list",
             "syspurpose show",
             "subscription-manager syspurpose --show",
+            "subscription-manager status",
         ], cmd_as_tag=True)
         self.add_cmd_output("rhsm-debug system --sos --no-archive "
                             "--no-subscriptions --destination %s"
@@ -102,5 +106,16 @@ class SubscriptionManager(Plugin, RedHatPlugin):
         passwdreg = r"(proxy_password(\s)*=(\s)*)(\S+)\n"
         repl = r"\1********\n"
         self.do_path_regex_sub("/etc/rhsm/rhsm.conf", passwdreg, repl)
+        # Scrub passwords in repositories
+        # Example of scrubbing:
+        #
+        #   password=hackme
+        # To:
+        #   password=********
+        #
+        # Whitespace around '=' is allowed.
+        regexp = r"(password(\s)*=(\s)*)(\S+)\n"
+        repl = r"\1********\n"
+        self.do_path_regex_sub("/var/lib/rhsm/repo_server_val/*", regexp, repl)
 
 # vim: et ts=4 sw=4

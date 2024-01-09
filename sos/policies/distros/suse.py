@@ -25,17 +25,16 @@ class SuSEPolicy(LinuxPolicy):
     def __init__(self, sysroot=None, init=None, probe_runtime=True,
                  remote_exec=None):
         super(SuSEPolicy, self).__init__(sysroot=sysroot, init=init,
-                                         probe_runtime=probe_runtime)
+                                         probe_runtime=probe_runtime,
+                                         remote_exec=remote_exec)
         self.valid_subclasses += [SuSEPlugin, RedHatPlugin]
 
         self.usrmove = False
         self.package_manager = RpmPackageManager()
 
-        pkgs = self.package_manager.all_pkgs()
-
         # If rpm query timed out after timeout duration exit
-        if not pkgs:
-            print("Could not obtain installed package list", file=sys.stderr)
+        if not self.package_manager.packages:
+            self.ui_log.error("Could not obtain installed package list.")
             sys.exit(1)
 
         self.PATH = "/usr/sbin:/usr/bin:/root/bin:/sbin"
@@ -49,28 +48,6 @@ class SuSEPolicy(LinuxPolicy):
         overriden by concrete subclasses to return True when running on an
         OpenSuSE, SLES or other Suse distribution and False otherwise."""
         return False
-
-    def runlevel_by_service(self, name):
-        from subprocess import Popen, PIPE
-        ret = []
-        p = Popen("LC_ALL=C /sbin/chkconfig --list %s" % name,
-                  shell=True,
-                  stdout=PIPE,
-                  stderr=PIPE,
-                  bufsize=-1,
-                  close_fds=True)
-        out, err = p.communicate()
-        if err:
-            return ret
-        for tabs in out.split()[1:]:
-            try:
-                (runlevel, onoff) = tabs.split(":", 1)
-            except IndexError:
-                pass
-            else:
-                if onoff == "on":
-                    ret.append(int(runlevel))
-        return ret
 
     def get_tmp_dir(self, opt_tmp_dir):
         if not opt_tmp_dir:

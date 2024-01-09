@@ -21,14 +21,17 @@ class Collectd(Plugin, IndependentPlugin):
     # or being inside Super Proviledged Container that does not have
     # the package but logs to the host's logfile
     packages = ('collectd',)
-    files = ('/var/log/containers/collectd/collectd.log',)
+    files = ('/var/log/containers/collectd/collectd.log',
+             '/var/log/collectd/collectd.log')
 
     def setup(self):
         self.add_copy_spec([
             '/etc/collectd.conf',
             '/etc/collectd.d/*.conf',
             '/var/log/containers/collectd/collectd.log',
-            '/var/lib/config-data/collectd',
+            '/var/lib/config-data/puppet-generated/collectd/etc/collectd.conf',
+            '/var/lib/config-data/puppet-generated/collectd/etc/collectd.d/'
+            + '*.conf',
         ])
 
         p = re.compile('^LoadPlugin.*')
@@ -48,7 +51,7 @@ class Collectd(Plugin, IndependentPlugin):
             "Password", "User",
             "[<]*URL", "Address"
         ]
-        regexp = r"((?m)^[#]*\s*(%s)\s* \s*)(.*)" % "|".join(protect_keys)
+        regexp = r"(^[#]*\s*(%s)\s* \s*)(.*)" % "|".join(protect_keys)
         self.do_path_regex_sub(
             "/etc/collectd.d/*.conf",
             regexp, r'\1"*********"'

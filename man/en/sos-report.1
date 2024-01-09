@@ -19,6 +19,7 @@ sos report \- Collect and package diagnostic and support data
           [--plugin-timeout TIMEOUT]\fR
           [--cmd-timeout TIMEOUT]\fR
           [--namespaces NAMESPACES]\fR
+          [--container-runtime RUNTIME]\fR
           [-s|--sysroot SYSROOT]\fR
           [-c|--chroot {auto|always|never}\fR
           [--tmp-dir directory]\fR
@@ -26,12 +27,15 @@ sos report \- Collect and package diagnostic and support data
           [--list-profiles]\fR
           [--verify]\fR
           [--log-size]\fR
+          [--journal-size]\fR
           [--all-logs]\fR
           [--since YYYYMMDD[HHMMSS]]\fR
           [--skip-commands commands]\fR
           [--skip-files files]\fR
           [--allow-system-changes]\fR
+          [--low-priority]\fR
           [-z|--compression-type method]\fR
+          [--encrypt]\fR
           [--encrypt-key KEY]\fR
           [--encrypt-pass PASS]\fR
           [--upload] [--upload-url url] [--upload-user user]\fR
@@ -183,13 +187,22 @@ Places a limit on the size of collected logs and output in MiB. Note that this
 causes sos to capture the last X amount of the file or command output collected.
 
 By default, this is set to 25 MiB and applies to all files and command output collected
-with the exception of journal collections, which are limited to 100 MiB.
+with the exception of journal collections, which are limited by the \fB--journal-size\fR
+option instead.
 
 Setting this value to 0 removes all size limitations, and any files or commands
 collected will be collected in their entirety, which may drastically increase the
 size of the final sos report tarball and the memory usage of sos during collection
-of commands, such as very large journals that may be several GiB in size.
+of commands.
 
+.TP
+.B \--journal-size
+Places a limit on the size of journals collected in MiB. Note that this causes sos
+to capture the last X amount of the journal.
+
+By default, this is set to 100 MiB. Setting this value to 0 removes all size limitations,
+as does the use of the \fB--all-logs\fR option. This may drastically increase the size
+of the final sos report tarball.
 .TP
 .B \--all-logs
 Tell plugins to collect all possible log data ignoring any size limits
@@ -218,8 +231,33 @@ for example \fB/etc/sos/*\fR.
 .B \--allow-system-changes
 Run commands even if they can change the system (e.g. load kernel modules).
 .TP
+.B \--low-priority
+Set sos to execute as a low priority process so that is does not interfere with
+other processes running on the system. Specific distributions may set their own
+constraints, but by default this involves setting process niceness to 19 and, if
+available, setting an idle IO class via ionice.
 .B \-z, \--compression-type METHOD
 Override the default compression type specified by the active policy.
+.TP
+.B \-\-encrypt
+Encrypt the resulting archive, and determine the method by which that encryption
+is done by either a user prompt or environment variables.
+
+When run with \fB--batch\fR, using this option will cause sos to look for either the
+\fBSOSENCRYPTKEY\fR or \fBSOSENCRYPTPASS\fR environment variables. If set, this will
+implicitly enable the \fB--encrypt-key\fR or \fB--encrypt-pass\fR options, respectively,
+to the values set by the environment variable. This enables the use of these options
+without directly setting those options in a config file or command line string. Note that
+use of an encryption key has precedence over a passphrase.
+
+Otherwise, using this option will cause sos to prompt the user to choose the method
+of encryption to use. Choices will be [P]assphrase, [K]ey, [E]nv vars, or [N]o encryption.
+If passphrase or key the user will then be prompted for the respective value, env vars will
+cause sos to source the information in the manner stated above, and choosing no encryption
+will disable encryption.
+
+See the sections on \fB--encrypt-key\fR and \fB--encrypt-pass\fR below for more
+information.
 .TP
 .B \--encrypt-key KEY
 Encrypts the resulting archive that sosreport produces using GPG. KEY must be
@@ -299,6 +337,24 @@ Use '0' (default) for no limit - all namespaces will be used for collections.
 
 Note that specific plugins may provide a similar `namespaces` plugin option. If
 the plugin option is used, it will override this option.
+.TP
+.B \--container-runtime RUNTIME
+Force the use of the specified RUNTIME as the default runtime that plugins will
+use to collect data from and about containers and container images. By default,
+the setting of \fBauto\fR results in the local policy determining what runtime
+will be the default runtime (in configurations where multiple runtimes are installed
+and active).
+
+If no container runtimes are active, this option is ignored. If there are runtimes
+active, but not one with a name matching RUNTIME, sos will abort.
+
+Setting this to \fBnone\fR, \fBoff\fR, or \fBdisabled\fR will cause plugins to
+\fBNOT\fR leverage any active runtimes for collections. Note that if disabled, plugins
+specifically for runtimes (e.g. the podman or docker plugins) will still collect
+general data about the runtime, but will not inspect existing containers or images.
+
+Default: 'auto' (policy determined)
+.TP
 .B \--case-id NUMBER
 Specify a case identifier to associate with the archive.
 Identifiers may include alphanumeric characters, commas and periods ('.').
@@ -324,9 +380,13 @@ is available at the end.
 
 Plugins will be collected sequentially, size of collected files and commands outputs
 will be calculated and the plugin files will be immediatelly deleted prior execution
-of the next plugin. This still can consume whole free disk space, though. Please note,
-size estimations may not be accurate for highly utilized systems due to changes between
-an estimate and a real execution.
+of the next plugin. This still can consume whole free disk space, though.
+
+Please note, size estimations may not be accurate for highly utilized systems due to
+changes between an estimate and a real execution. Also some difference between
+estimation (using `stat` command) and other commands used (i.e. `du`).
+
+A rule of thumb is to reserve at least double the estimation.
 .TP
 .B \--upload
 If specified, attempt to upload the resulting archive to a vendor defined location.
@@ -434,7 +494,7 @@ Display usage message.
 
 .SH MAINTAINER
 .nf
-Jake Hunsaker <jhunsake@redhat.com>
+Maintained on GitHub at https://github.com/sosreport/sos
 .fi
 .SH AUTHORS & CONTRIBUTORS
 See \fBAUTHORS\fR file in the package documentation.

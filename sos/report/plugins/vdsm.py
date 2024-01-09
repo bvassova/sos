@@ -29,7 +29,8 @@ import re
 # use_lvmetad is set to 0 in order not to show cached, old lvm metadata.
 # use_lvmetad=0
 #
-# preferred_names and filter config values are set to capture Vdsm devices.
+# preferred_names, use_devicesfile and filter config values are set to
+# capture Vdsm devices.
 # preferred_names=[ '^/dev/mapper/' ]
 # filter=[ 'a|^/dev/mapper/.*|', 'r|.*|' ]
 LVM_CONFIG = """
@@ -43,6 +44,7 @@ devices {
     ignore_suspended_devices=1
     write_cache_state=0
     disable_after_error_count=3
+    use_devicesfile=0
     filter=["a|^/dev/disk/by-id/dm-uuid-mpath-|", "r|.+|"]
 }
 """
@@ -63,6 +65,7 @@ class Vdsm(Plugin, RedHatPlugin):
         self.add_forbidden_path('/etc/pki/vdsm/keys')
         self.add_forbidden_path('/etc/pki/vdsm/*/*-key.*')
         self.add_forbidden_path('/etc/pki/libvirt/private')
+        self.add_forbidden_path('/var/lib/vdsm/storage/transient_disks')
 
         self.add_service_status(['vdsmd', 'supervdsmd'])
 
@@ -81,6 +84,12 @@ class Vdsm(Plugin, RedHatPlugin):
             '/usr/libexec/vdsm/hooks',
             '/var/lib/vdsm',
         ])
+
+        self.add_file_tags({
+            "/etc/vdsm/vdsm.conf": "vdsm_conf",
+            "/etc/vdsm/vdsm.id": "vdsm_id",
+            "/var/log/vdsm/import/import-*.log": "vdsm_import_log"
+        })
 
         qemu_pids = self.get_process_pids('qemu-kvm')
         if qemu_pids:

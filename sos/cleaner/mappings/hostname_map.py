@@ -40,6 +40,9 @@ class SoSHostnameMap(SoSMap):
         'api'
     ]
 
+    strip_exts = ('.yaml', '.yml', '.crt', '.key', '.pem', '.log', '.repo',
+                  '.rules', '.conf', '.cfg')
+
     host_count = 0
     domain_count = 0
     _domains = {}
@@ -50,10 +53,14 @@ class SoSHostnameMap(SoSMap):
         in this parser, we need to re-inject entries from the map_file into
         these dicts and not just the underlying 'dataset' dict
         """
-        for domain in self.dataset:
+        for domain, ob_pair in self.dataset.items():
             if len(domain.split('.')) == 1:
                 self.hosts[domain.split('.')[0]] = self.dataset[domain]
             else:
+                if ob_pair.startswith('obfuscateddomain'):
+                    # directly exact domain matches
+                    self._domains[domain] = ob_pair.split('.')[0]
+                    continue
                 # strip the host name and trailing top-level domain so that
                 # we in inject the domain properly for later string matching
 
@@ -73,9 +80,14 @@ class SoSHostnameMap(SoSMap):
                         self._domains[_domain_to_inject] = _ob_domain
         self.set_initial_counts()
 
-    def load_domains_from_options(self, domains):
-        for domain in domains:
-            self.sanitize_domain(domain.split('.'))
+    def get_regex_result(self, item):
+        """Override the base get_regex_result() to provide a regex that, if
+        this is an FQDN or a straight domain, will include an underscore
+        formatted regex as well.
+        """
+        if '.' in item:
+            item = item.replace('.', '(\\.|_)')
+        return re.compile(item, re.I)
 
     def set_initial_counts(self):
         """Set the initial counter for host and domain obfuscation numbers
@@ -101,15 +113,16 @@ class SoSHostnameMap(SoSMap):
         """Check if a potential domain is in one of the domains we've loaded
         and should be obfuscated
         """
+        if domain in self._domains:
+            return True
         host = domain.split('.')
+        no_tld = '.'.join(domain.split('.')[0:-1])
         if len(host) == 1:
             # don't block on host's shortname
-            return host[0] in self.hosts.keys()
-        else:
-            domain = host[0:-1]
-            for known_domain in self._domains:
-                if known_domain in domain:
-                    return True
+            return host[0] in self.hosts
+        elif any([no_tld.endswith(_d) for _d in self._domains]):
+            return True
+
         return False
 
     def get(self, item):
@@ -127,9 +140,13 @@ class SoSHostnameMap(SoSMap):
         while item.endswith(('.', '_')):
             suffix += item[-1]
             item = item[0:-1]
+        if item in self.dataset:
+            return self.dataset[item]
         if not self.domain_name_in_loaded_domains(item.lower()):
-            return item
-        if item.endswith(('.yaml', '.yml', '.crt', '.key', '.pem')):
+            # no match => return the original string with optional
+            # leading/trailing '.' or '_' characters
+            return ''.join([prefix, item, suffix])
+        if item.endswith(self.strip_exts):
             ext = '.' + item.split('.')[-1]
             item = item.replace(ext, '')
             suffix += ext
@@ -148,7 +165,8 @@ class SoSHostnameMap(SoSMap):
                 if len(_test) == 1 or not _test[0]:
                     # does not match existing obfuscation
                     continue
-                elif _test[0].endswith('.') and not _host_substr:
+                elif not _host_substr and (_test[0].endswith('.') or
+                                           item.endswith(_existing)):
                     # new hostname in known domain
                     final = super(SoSHostnameMap, self).get(item)
                     break
@@ -169,16 +187,15 @@ class SoSHostnameMap(SoSMap):
 
     def sanitize_item(self, item):
         host = item.split('.')
-        if len(host) > 1 and all([h.isupper() for h in host]):
-            # by convention we have just a domain
-            _host = [h.lower() for h in host]
-            return self.sanitize_domain(_host).upper()
         if len(host) == 1:
             # we have a shortname for a host
             return self.sanitize_short_name(host[0].lower())
         if len(host) == 2:
             # we have just a domain name, e.g. example.com
-            return self.sanitize_domain(host)
+            dname = self.sanitize_domain(host)
+            if all([h.isupper() for h in host]):
+                dname = dname.upper()
+            return dname
         if len(host) > 2:
             # we have an FQDN, e.g. foo.example.com
             hostname = host[0]
@@ -194,20 +211,25 @@ class SoSHostnameMap(SoSMap):
                 ob_hostname = 'unknown'
             ob_domain = self.sanitize_domain(domain)
             self.dataset[item] = ob_domain
-            return '.'.join([ob_hostname, ob_domain])
+            _fqdn = '.'.join([ob_hostname, ob_domain])
+            if all([h.isupper() for h in host]):
+                _fqdn = _fqdn.upper()
+            return _fqdn
+        return None
 
     def sanitize_short_name(self, hostname):
         """Obfuscate the short name of the host with an incremented counter
         based on the total number of obfuscated host names
         """
-        if not hostname:
+        if not hostname or hostname in self.skip_keys:
             return hostname
-        if hostname not in self.hosts:
+        if hostname not in self.dataset:
             ob_host = "host%s" % self.host_count
             self.hosts[hostname] = ob_host
             self.host_count += 1
             self.dataset[hostname] = ob_host
-        return self.hosts[hostname]
+            self.add_regex_item(hostname)
+        return self.dataset[hostname]
 
     def sanitize_domain(self, domain):
         """Obfuscate the domainname, broken out into subdomains. Top-level
@@ -217,8 +239,8 @@ class SoSHostnameMap(SoSMap):
             # don't obfuscate vendor domains
             if re.match(_skip, '.'.join(domain)):
                 return '.'.join(domain)
-        top_domain = domain[-1]
-        dname = '.'.join(domain[0:-1])
+        top_domain = domain[-1].lower()
+        dname = '.'.join(domain[0:-1]).lower()
         ob_domain = self._new_obfuscated_domain(dname)
         ob_domain = '.'.join([ob_domain, top_domain])
         self.dataset['.'.join(domain)] = ob_domain

@@ -17,15 +17,14 @@ class OpenStackDesignate(Plugin):
     profiles = ('openstack', 'openstack_controller')
 
     var_puppet_gen = "/var/lib/config-data/puppet-generated/designate"
+    var_ansible_gen = "/var/lib/config-data/ansible-generated"
 
     def setup(self):
         # collect current pool config
-        pools_cmd = self.fmt_container_cmd(
-            self.get_container_by_name(".*designate_central"),
-            "designate-manage pool generate_file --file /dev/stdout")
 
         self.add_cmd_output(
-            pools_cmd,
+            "designate-manage pool generate_file --file /dev/stdout",
+            container=self.get_container_by_name(".*designate_central"),
             suggest_filename="openstack_designate_current_pools.yaml"
         )
 
@@ -34,6 +33,9 @@ class OpenStackDesignate(Plugin):
             "/etc/designate/*",
             self.var_puppet_gen + "/etc/designate/designate.conf",
             self.var_puppet_gen + "/etc/designate/pools.yaml",
+            self.var_ansible_gen + "/designate/etc/designate/named.conf",
+            self.var_ansible_gen + "/designate/etc/designate/named/*",
+            self.var_ansible_gen + "/unbound/*"
         ])
 
         # logs
@@ -41,11 +43,15 @@ class OpenStackDesignate(Plugin):
             self.add_copy_spec([
                 "/var/log/designate/*",
                 "/var/log/containers/designate/*",
+                "/var/log/containers/designate-bind/*",
+                "/var/log/containers/unbound/*"
             ])
         else:
             self.add_copy_spec([
                 "/var/log/designate/*.log",
-                "/var/log/containers/designate/*.log"
+                "/var/log/containers/designate/*.log",
+                "/var/log/containers/designate-bind/*.log",
+                "/var/log/containers/unbound/*.log"
             ])
 
         subcmds = [
@@ -83,7 +89,7 @@ class OpenStackDesignate(Plugin):
             "ssl_key_password", "ssl_client_key_password",
             "memcache_secret_key"
         ]
-        regexp = r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys)
+        regexp = r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys)
 
         self.do_path_regex_sub("/etc/designate/*", regexp, r"\1*********")
         self.do_path_regex_sub(

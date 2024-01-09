@@ -162,7 +162,7 @@ class OpenShiftOrigin(Plugin):
                                         "atomic-openshift-master-api",
                                         "atomic-openshift-master-controllers"])
 
-            # get logs from the infrastruture pods running in the default ns
+            # get logs from the infrastructure pods running in the default ns
             pods = self.exec_cmd("%s get pod -o name -n default"
                                  % oc_cmd_admin)
             for pod in pods['output'].splitlines():
@@ -201,14 +201,11 @@ class OpenShiftOrigin(Plugin):
                      r'|PASS|PWD|KEY|TOKEN|CRED|SECRET)[^,]*,' \
                      r'\s*"value":)[^}]*'
         self.do_cmd_output_sub('oc*json', env_regexp, r'\g<var> "********"')
-        # LDAP identity provider
+        # LDAP identity provider (bindPassword)
+        # and github/google/OpenID identity providers (clientSecret)
         self.do_file_sub(self.master_cfg,
-                         r"(bindPassword:\s*)(.*)",
-                         r'\1"********"')
-        # github/google/OpenID identity providers
-        self.do_file_sub(self.master_cfg,
-                         r"(clientSecret:\s*)(.*)",
-                         r'\1"********"')
+                         r"(bindPassword|clientSecret):\s*(.*)",
+                         r'\1:"********"')
 
 
 class AtomicOpenShift(OpenShiftOrigin, RedHatPlugin):

@@ -17,7 +17,8 @@ class OpenStackNeutron(Plugin):
 
     short_desc = 'OpenStack Networking'
     plugin_name = "openstack_neutron"
-    profiles = ('openstack', 'openstack_controller', 'openstack_compute')
+    profiles = ('openstack', 'openstack_controller',
+                'openstack_compute', 'openstack_edpm')
 
     var_puppet_gen = "/var/lib/config-data/puppet-generated/neutron"
 
@@ -63,6 +64,11 @@ class OpenStackNeutron(Plugin):
             self.add_cmd_output("openstack floating ip list")
             self.add_cmd_output("openstack security group list")
 
+        self.add_file_tags({
+            ".*/etc/neutron/plugins/ml2/ml2_conf.ini": "neutronml2_conf",
+            "/var/log/neutron/server.log": "neutron_server_log"
+        })
+
     def apply_regex_sub(self, regexp, subst):
         self.do_path_regex_sub("/etc/neutron/*", regexp, subst)
         self.do_path_regex_sub(
@@ -78,16 +84,17 @@ class OpenStackNeutron(Plugin):
             "crd_password", "primary_l3_host_password", "serverauth",
             "ucsm_password", "ha_vrrp_auth_password", "ssl_key_password",
             "nsx_password", "vcenter_password", "edge_appliance_password",
-            "tenant_admin_password", "apic_password", "transport_url"
+            "tenant_admin_password", "apic_password", "transport_url",
+            "memcache_secret_key"
         ]
         connection_keys = ["connection"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )
@@ -105,7 +112,7 @@ class DebianNeutron(OpenStackNeutron, DebianPlugin, UbuntuPlugin):
         'neutron-plugin-ryu-agent',
         'neutron-server',
         'python-neutron',
-        'python-neutronclient'
+        'python3-neutron',
     )
 
     def check_enabled(self):
@@ -119,9 +126,15 @@ class DebianNeutron(OpenStackNeutron, DebianPlugin, UbuntuPlugin):
 class RedHatNeutron(OpenStackNeutron, RedHatPlugin):
 
     packages = ('openstack-selinux',)
+    var_ansible_gen = "/var/lib/config-data/ansible-generated/"
 
     def setup(self):
         super(RedHatNeutron, self).setup()
-        self.add_copy_spec("/etc/sudoers.d/neutron-rootwrap")
+        self.add_copy_spec([
+            "/etc/sudoers.d/neutron-rootwrap",
+            self.var_ansible_gen + "/neutron-dhcp-agent/",
+            self.var_ansible_gen + "/neutron-dhcp-ovn/",
+            self.var_ansible_gen + "/neutron-sriov-agent/"
+        ])
 
 # vim: set et ts=4 sw=4 :

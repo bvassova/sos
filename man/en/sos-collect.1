@@ -11,6 +11,7 @@ sos collect \- Collect sosreports from multiple (cluster) nodes
     [\-\-chroot CHROOT]
     [\-\-case\-id CASE_ID]
     [\-\-cluster\-type CLUSTER_TYPE]
+    [\-\-container\-runtime RUNTIME]
     [\-e ENABLE_PLUGINS]
     [--encrypt-key KEY]\fR
     [--encrypt-pass PASS]\fR
@@ -27,7 +28,7 @@ sos collect \- Collect sosreports from multiple (cluster) nodes
     [\-\-no\-local]
     [\-\-primary PRIMARY]
     [\-\-image IMAGE]
-    [\-\-force-pull-image]
+    [\-\-force-pull-image TOGGLE, --pull TOGGLE]
     [\-\-registry-user USER]
     [\-\-registry-password PASSWORD]
     [\-\-registry-authfile FILE]
@@ -40,7 +41,6 @@ sos collect \- Collect sosreports from multiple (cluster) nodes
     [\-\-skip-files FILES]
     [\-s|\-\-sysroot SYSROOT]
     [\-\-ssh\-user SSH_USER]
-    [\-\-sos-cmd SOS_CMD]
     [\-t|\-\-threads THREADS]
     [\-\-timeout TIMEOUT]
     [\-\-transport TRANSPORT]
@@ -113,6 +113,11 @@ Example: \fBsos collect --cluster-type=kubernetes\fR will force the kubernetes p
 to be run, and thus set sosreport options and attempt to determine a list of nodes using
 that profile. 
 .TP
+\fB\-\-container\-runtime\fR RUNTIME
+\fB sos report\fR option. Using this with \fBcollect\fR will pass this option thru
+to nodes with sos version 4.3 or later. This option controls the default container
+runtime plugins will use for collections. See \fBman sos-report\fR.
+.TP
 \fB\-e\fR ENABLE_PLUGINS, \fB\-\-enable\-plugins\fR ENABLE_PLUGINS
 Sosreport option. Use this to enable a plugin that would otherwise not be run.
 
@@ -171,7 +176,7 @@ to none.
 \fB\-\-save\-group\fR GROUP
 Save the results of this run of sos collect to a host group definition.
 
-sos-colllector will write a JSON-formatted file with name GROUP to /var/lib/sos collect/
+sos-collector will write a JSON-formatted file with name GROUP to /var/lib/sos collect/
 with the settings for cluster-type, primary, and the node list as discovered by cluster enumeration.
 Note that this means regexes are not directly saved to host groups, but the results of matching against
 those regexes are.
@@ -253,13 +258,19 @@ the type of cluster in use.
 .TP
 \fB\-\-image IMAGE\fR
 Specify an image to use for the temporary container created for collections on
-containerized host, if you do not want to use the default image specifed by the
+containerized host, if you do not want to use the default image specified by the
 host's policy. Note that this should include the registry.
 .TP
-\fB\-\-force-pull-image\fR
-Use this option to force the container runtime to pull the specified image (even
-if it is the policy default image) even if the image already exists on the host.
-This may be useful to update an older container image on containerized hosts.
+\fB\-\-force-pull-image TOGGLE, \-\-pull TOGGLE\fR
+When collecting an sos report from a containerized host, force the host to always
+pull the specified image, even if that image already exists on the host.
+This is useful to ensure that the latest version of that image is always in use.
+Disabling this option will use whatever version of the image is present on the node,
+and only attempt a pull if there is no copy of the image present at all.
+
+Enable with true/on/yes or disable with false/off/no
+
+Default: true
 .TP
 \fB\-\-registry-user USER\fR
 Specify the username to authenticate to the registry with in order to pull the container
@@ -327,15 +338,6 @@ sos collect will prompt for a sudo password for non-root users.
 \fB\-s\fR SYSROOT, \fB\-\-sysroot\fR SYSROOT
 Sosreport option. Specify an alternate root file system path.
 .TP
-\fB\-\-sos-cmd\fR SOS_CMD
-Define all options that sosreport should be run with on the nodes. This will
-override any other commandline options as well as any options specified by a 
-cluster profile.
-
-The sosreport command will execute as 'sosreport --batch SOS_CMD'. The BATCH 
-option cannot be removed from the sosreport command as it is required to run 
-sosreport non-interactively for sos collect to function.
-.TP
 \fB\-t\fR THREADS \fB\-\-threads\fR THREADS
 Report option. Specify the number of collection threads to run.
 
@@ -376,7 +378,7 @@ This is NOT the same as specifying a temporary directory for sosreport on the re
 \fB\-v\fR \fB\-\-verbose\fR
 Print debug information to screen.
 .TP
-\fB\-\-verfiy\fR
+\fB\-\-verify\fR
 Sosreport option. Passes the "--verify" option to sosreport on the nodes which 
 causes sosreport to validate plugin-specific data during collection.
 
@@ -393,4 +395,8 @@ Sosreport option. Override the default compression type.
 .BR sos.conf (5)
 
 .SH MAINTAINER
-    Jake Hunsaker <jhunsake@redhat.com>
+.nf
+Maintained on GitHub at https://github.com/sosreport/sos
+.fi
+.SH AUTHORS & CONTRIBUTORS
+See \fBAUTHORS\fR file in the package documentation.

@@ -64,10 +64,16 @@ class ContainerRuntime():
         :returns: ``True`` if the runtime is active, else ``False``
         :rtype: ``bool``
         """
-        if is_executable(self.binary):
+        if is_executable(self.binary, self.policy.sysroot):
             self.active = True
             return True
         return False
+
+    def check_can_copy(self):
+        """Check if the runtime supports copying files out of containers and
+        onto the host filesystem
+        """
+        return True
 
     def get_containers(self, get_all=False):
         """Get a list of containers present on the system.
@@ -78,7 +84,7 @@ class ContainerRuntime():
         containers = []
         _cmd = "%s ps %s" % (self.binary, '-a' if get_all else '')
         if self.active:
-            out = sos_get_command_output(_cmd)
+            out = sos_get_command_output(_cmd, chroot=self.policy.sysroot)
             if out['status'] == 0:
                 for ent in out['output'].splitlines()[1:]:
                     ent = ent.split()
@@ -100,7 +106,7 @@ class ContainerRuntime():
             return None
         for c in self.containers:
             if re.match(name, c[1]):
-                return c[1]
+                return c[0]
         return None
 
     def get_images(self):
@@ -112,8 +118,10 @@ class ContainerRuntime():
         images = []
         fmt = '{{lower .Repository}}:{{lower .Tag}} {{lower .ID}}'
         if self.active:
-            out = sos_get_command_output("%s images --format '%s'"
-                                         % (self.binary, fmt))
+            out = sos_get_command_output(
+                "%s images --format '%s'" % (self.binary, fmt),
+                chroot=self.policy.sysroot
+            )
             if out['status'] == 0:
                 for ent in out['output'].splitlines():
                     ent = ent.split()
@@ -129,12 +137,32 @@ class ContainerRuntime():
         """
         vols = []
         if self.active:
-            out = sos_get_command_output("%s volume ls" % self.binary)
+            out = sos_get_command_output(
+                "%s volume ls" % self.binary,
+                chroot=self.policy.sysroot
+            )
             if out['status'] == 0:
                 for ent in out['output'].splitlines()[1:]:
                     ent = ent.split()
                     vols.append(ent[-1])
         return vols
+
+    def container_exists(self, container):
+        """Check if a given container ID or name exists on the system from the
+        perspective of the container runtime.
+
+        Note that this will only check _running_ containers
+
+        :param container:       The name or ID of the container
+        :type container:        ``str``
+
+        :returns:               True if the container exists, else False
+        :rtype:                 ``bool``
+        """
+        for _contup in self.containers:
+            if container in _contup:
+                return True
+        return False
 
     def fmt_container_cmd(self, container, cmd, quotecmd):
         """Format a command to run inside a container using the runtime
@@ -194,5 +222,31 @@ class ContainerRuntime():
         """
         return "%s logs -t %s" % (self.binary, container)
 
+    def get_copy_command(self, container, path, dest, sizelimit=None):
+        """Generate the command string used to copy a file out of a container
+        by way of the runtime.
+
+        :param container:   The name or ID of the container
+        :type container:    ``str``
+
+        :param path:        The path to copy from the container. Note that at
+                            this time, no supported runtime supports globbing
+        :type path:         ``str``
+
+        :param dest:        The destination on the *host* filesystem to write
+                            the file to
+        :type dest:         ``str``
+
+        :param sizelimit:   Limit the collection to the last X bytes of the
+                            file at PATH
+        :type sizelimit:    ``int``
+
+        :returns:   Formatted runtime command to copy a file from a container
+        :rtype:     ``str``
+        """
+        if sizelimit:
+            return "%s %s tail -c %s %s" % (self.run_cmd, container, sizelimit,
+                                            path)
+        return "%s cp %s:%s %s" % (self.binary, container, path, dest)
 
 # vim: set et ts=4 sw=4 :

@@ -46,6 +46,10 @@ class OpenStackOctavia(Plugin):
             self.var_puppet_gen + "/etc/my.cnf.d/tripleo.cnf",
         ])
 
+        self.add_file_tags({
+            ".*/etc/octavia/octavia.conf": "octavia_conf"
+        })
+
         # don't collect certificates
         self.add_forbidden_path("/etc/octavia/certs")
         self.add_forbidden_path(self.var_config_data + "/etc/octavia/certs")
@@ -110,9 +114,10 @@ class OpenStackOctavia(Plugin):
     def postproc(self):
         protect_keys = [
             "ca_private_key_passphrase", "heartbeat_key", "password",
-            "connection", "transport_url", "server_certs_key_passphrase"
+            "connection", "transport_url", "server_certs_key_passphrase",
+            "memcache_secret_key"
         ]
-        regexp = r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys)
+        regexp = r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys)
 
         self.do_path_regex_sub("/etc/octavia/*", regexp, r"\1*********")
         self.do_path_regex_sub(
@@ -123,7 +128,11 @@ class OpenStackOctavia(Plugin):
 
 class DebianOctavia(OpenStackOctavia, DebianPlugin, UbuntuPlugin):
 
-    packages = ('octavia-common', 'octavia-api', )
+    packages = (
+        'octavia-common',
+        'octavia-api',
+        'python3-octavia',
+    )
 
     def setup(self):
         super(DebianOctavia, self).setup()

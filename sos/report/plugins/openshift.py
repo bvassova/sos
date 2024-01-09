@@ -19,7 +19,10 @@ class Openshift(Plugin, RedHatPlugin):
     further extending the kubernetes plugin (or the OCP 3.x extensions included
     in the Red Hat version of the kube plugin).
 
-    By default, this plugin will collect cluster information and inspect the
+    This plugin may collect OCP API information when the `with-api` option is
+    enabled. This option is disabled by default.
+
+    When enabled, this plugin will collect cluster information and inspect the
     default namespaces/projects that are created during deployment - i.e. the
     namespaces of the cluster projects matching openshift.* and kube.*. At the
     time of this plugin's creation that number of default projects is already
@@ -34,16 +37,20 @@ class Openshift(Plugin, RedHatPlugin):
 
     Users will need to either:
 
-        1) Provide the bearer token via the `-k openshift.token` option
-        2) Provide the bearer token via the `SOSOCPTOKEN` environment variable
-        3) Otherwise ensure that the root user can successfully run `oc` and
+        1) Accept the use of a well-known stock kubeconfig file provided via a
+           static pod resource for the kube-apiserver
+        2) Provide the bearer token via the `-k openshift.token` option
+        3) Provide the bearer token via the `SOSOCPTOKEN` environment variable
+        4) Otherwise ensure that the root user can successfully run `oc` and
            get proper output prior to running this plugin
 
 
-    It is highly suggested that option #2 be used first, as this will prevent
-    the token from being recorded in output saved to the archive. Option #1 may
+    It is highly suggested that option #1 be used first, as this uses well
+    known configurations and requires the least information from the user. If
+    using a token, it is recommended to use option #3 as this will prevent
+    the token from being recorded in output saved to the archive. Option #2 may
     be used if this is considered an acceptable risk. It is not recommended to
-    rely on option #3, though it will provide the functionality needed.
+    rely on option #4, though it will provide the functionality needed.
     """
 
     short_desc = 'Openshift Container Platform 4.x'
@@ -53,12 +60,20 @@ class Openshift(Plugin, RedHatPlugin):
     profiles = ('openshift',)
     packages = ('openshift-hyperkube',)
 
+    master_localhost_kubeconfig = (
+        '/etc/kubernetes/static-pod-resources/'
+        'kube-apiserver-certs/secrets/node-kubeconfigs/localhost.kubeconfig'
+        )
+
     option_list = [
         PluginOpt('token', default=None, val_type=str,
                   desc='admin token to allow API queries'),
+        PluginOpt('kubeconfig', default=None, val_type=str,
+                  desc='Path to a locally available kubeconfig file'),
         PluginOpt('host', default='https://localhost:6443',
                   desc='host address to use for oc login, including port'),
-        PluginOpt('no-oc', default=False, desc='do not collect `oc` output'),
+        PluginOpt('with-api', default=False,
+                  desc='collect output from the OCP API'),
         PluginOpt('podlogs', default=True, desc='collect logs from each pod'),
         PluginOpt('podlogs-filter', default='', val_type=str,
                   desc='only collect logs from pods matching this pattern'),
@@ -73,6 +88,10 @@ class Openshift(Plugin, RedHatPlugin):
         """Check to see if we can run `oc` commands"""
         return self.exec_cmd('oc whoami')['status'] == 0
 
+    def _check_localhost_kubeconfig(self):
+        """Check if the localhost.kubeconfig exists with system:admin user"""
+        return self.path_exists(self.get_option('kubeconfig'))
+
     def _check_oc_logged_in(self):
         """See if we're logged in to the API service, and if not attempt to do
         so using provided plugin options
@@ -80,8 +99,38 @@ class Openshift(Plugin, RedHatPlugin):
         if self._check_oc_function():
             return True
 
-        # Not logged in currently, attempt to do so
+        if self.get_option('kubeconfig') is None:
+            # If admin doesn't add the kubeconfig
+            # use default localhost.kubeconfig
+            self.set_option(
+                'kubeconfig',
+                self.master_localhost_kubeconfig
+            )
+
+        # Check first if we can use the localhost.kubeconfig before
+        # using token. We don't want to use 'host' option due we use
+        # cluster url from kubeconfig. Default is localhost.
+        if self._check_localhost_kubeconfig():
+            self.set_default_cmd_environment({
+                'KUBECONFIG': self.get_option('kubeconfig')
+            })
+
+            oc_res = self.exec_cmd(
+                "oc login -u system:admin "
+                "--insecure-skip-tls-verify=True"
+            )
+            if oc_res['status'] == 0 and self._check_oc_function():
+                return True
+
+            self._log_warn(
+                "The login command failed with status: %s and error: %s"
+                % (oc_res['status'], oc_res['output'])
+            )
+            return False
+
+        # If kubeconfig is not defined, check if token is provided.
         token = self.get_option('token') or os.getenv('SOSOCPTOKEN', None)
+
         if token:
             oc_res = self.exec_cmd("oc login %s --token=%s "
                                    "--insecure-skip-tls-verify=True"
@@ -171,7 +220,7 @@ class Openshift(Plugin, RedHatPlugin):
         self.add_copy_spec('/etc/kubernetes/*')
 
         # see if we run `oc` commands
-        if not self.get_option('no-oc'):
+        if self.get_option('with-api'):
             can_run_oc = self._check_oc_logged_in()
         else:
             can_run_oc = False

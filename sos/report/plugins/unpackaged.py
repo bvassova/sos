@@ -19,7 +19,7 @@ class Unpackaged(Plugin, RedHatPlugin):
                   'package manager')
     plugin_name = 'unpackaged'
 
-    def setup(self):
+    def collect(self):
 
         def get_env_path_list():
             """Return a list of directories in $PATH.
@@ -46,10 +46,12 @@ class Unpackaged(Plugin, RedHatPlugin):
                             path = Path(path).resolve()
                     except Exception:
                         continue
-                    file_list.append(os.path.realpath(path))
+                    file_list.append(
+                        [self.path_join(root, name), os.path.realpath(path)]
+                    )
                 for name in dirs:
-                    file_list.append(os.path.realpath(
-                                     self.path_join(root, name)))
+                    name = self.path_join(root, name)
+                    file_list.append([name, os.path.realpath(name)])
 
             return file_list
 
@@ -58,29 +60,38 @@ class Unpackaged(Plugin, RedHatPlugin):
             """
             expanded = []
             for f in files:
-                if self.path_islink(f):
-                    expanded.append("{} -> {}".format(f, os.readlink(f)))
-                else:
-                    expanded.append(f)
+                fp = self.path_join(f)
+                out = f"{fp}"
+                links = 0
+                # expand links like
+                # /usr/bin/jfr -> /etc/alternatives/jfr ->
+                # /usr/lib/jvm/java-11-openjdk-11.0.17.0.8-2.el9.x86_64/bin/jfr
+                # but stop at level 10 to prevent potential recursive links
+                while self.path_islink(fp) and links < 10:
+                    fp = os.readlink(fp)
+                    out += f" -> {fp}"
+                    links += 1
+                expanded.append(out + '\n')
             return expanded
 
         # Check command predicate to avoid costly processing
         if not self.test_predicate(cmd=True):
             return
 
-        paths = get_env_path_list()
-        all_fsystem = []
-        all_frpm = set(
-            os.path.realpath(x) for x in self.policy.mangle_package_path(
-                self.policy.package_manager.all_files()
-            ) if any([x.startswith(p) for p in paths])
-        )
+        with self.collection_file('unpackaged') as ufile:
+            paths = get_env_path_list()
+            all_fsystem = []
+            all_frpm = set(
+                os.path.realpath(x) for x in self.policy.mangle_package_path(
+                    self.policy.package_manager.all_files()
+                ) if any([x.startswith(p) for p in paths])
+            )
 
-        for d in paths:
-            all_fsystem += all_files_system(d)
-        not_packaged = [x for x in all_fsystem if x not in all_frpm]
-        not_packaged_expanded = format_output(not_packaged)
-        self.add_string_as_file('\n'.join(not_packaged_expanded), 'unpackaged',
-                                plug_dir=True)
+            for d in paths:
+                all_fsystem += all_files_system(d)
+            not_packaged = [x for [x, rp] in all_fsystem if rp not in all_frpm]
+            not_packaged_expanded = format_output(not_packaged)
+
+            ufile.write(''.join(not_packaged_expanded))
 
 # vim: set et ts=4 sw=4 :

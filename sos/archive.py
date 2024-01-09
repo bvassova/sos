@@ -16,6 +16,7 @@ import logging
 import codecs
 import errno
 import stat
+import re
 from datetime import datetime
 from threading import Lock
 
@@ -72,7 +73,7 @@ class Archive(object):
     # this is our contract to clients of the Archive class hierarchy.
     # All sub-classes need to implement these methods (or inherit concrete
     # implementations from a parent class.
-    def add_file(self, src, dest=None):
+    def add_file(self, src, dest=None, force=False):
         raise NotImplementedError
 
     def add_string(self, content, dest, mode='w'):
@@ -135,6 +136,9 @@ class FileCacheArchive(Archive):
     def __init__(self, name, tmpdir, policy, threads, enc_opts, sysroot,
                  manifest=None):
         self._name = name
+        # truncate the name just relative to the tmpdir in case of full path
+        if os.path.commonprefix([self._name, tmpdir]) == tmpdir:
+            self._name = os.path.relpath(name, tmpdir)
         self._tmp_dir = tmpdir
         self._policy = policy
         self._threads = threads
@@ -153,7 +157,7 @@ class FileCacheArchive(Archive):
         return (os.path.join(self._archive_root, name))
 
     def join_sysroot(self, path):
-        if path.startswith(self.sysroot):
+        if not self.sysroot or path.startswith(self.sysroot):
             return path
         if path[0] == os.sep:
             path = path[1:]
@@ -251,7 +255,7 @@ class FileCacheArchive(Archive):
 
         return dest
 
-    def _check_path(self, src, path_type, dest=None, force=False):
+    def check_path(self, src, path_type, dest=None, force=False):
         """Check a new destination path in the archive.
 
             Since it is possible for multiple plugins to collect the same
@@ -340,12 +344,12 @@ class FileCacheArchive(Archive):
             self.log_debug("caught '%s' setting attributes of '%s'"
                            % (e, dest))
 
-    def add_file(self, src, dest=None):
+    def add_file(self, src, dest=None, force=False):
         with self._path_lock:
             if not dest:
                 dest = src
 
-            dest = self._check_path(dest, P_FILE)
+            dest = self.check_path(dest, P_FILE, force=force)
             if not dest:
                 return
 
@@ -384,32 +388,32 @@ class FileCacheArchive(Archive):
             # over any exixting content in the archive, since it is used by
             # the Plugin postprocessing hooks to perform regex substitution
             # on file content.
-            dest = self._check_path(dest, P_FILE, force=True)
+            dest = self.check_path(dest, P_FILE, force=True)
 
-            f = codecs.open(dest, mode, encoding='utf-8')
-            if isinstance(content, bytes):
-                content = content.decode('utf8', 'ignore')
-            f.write(content)
-            if os.path.exists(src):
-                self._copy_attributes(src, dest)
-            self.log_debug("added string at '%s' to FileCacheArchive '%s'"
-                           % (src, self._archive_root))
+            with codecs.open(dest, mode, encoding='utf-8') as f:
+                if isinstance(content, bytes):
+                    content = content.decode('utf8', 'ignore')
+                f.write(content)
+                if os.path.exists(src):
+                    self._copy_attributes(src, dest)
+                self.log_debug("added string at '%s' to FileCacheArchive '%s'"
+                               % (src, self._archive_root))
 
     def add_binary(self, content, dest):
         with self._path_lock:
-            dest = self._check_path(dest, P_FILE)
+            dest = self.check_path(dest, P_FILE)
             if not dest:
                 return
 
-            f = codecs.open(dest, 'wb', encoding=None)
-            f.write(content)
+            with codecs.open(dest, 'wb', encoding=None) as f:
+                f.write(content)
             self.log_debug("added binary content at '%s' to archive '%s'"
                            % (dest, self._archive_root))
 
     def add_link(self, source, link_name):
         self.log_debug("adding symlink at '%s' -> '%s'" % (link_name, source))
         with self._path_lock:
-            dest = self._check_path(link_name, P_LINK)
+            dest = self.check_path(link_name, P_LINK)
             if not dest:
                 return
 
@@ -484,10 +488,10 @@ class FileCacheArchive(Archive):
         """
         # Establish path structure
         with self._path_lock:
-            self._check_path(path, P_DIR)
+            self.check_path(path, P_DIR)
 
     def add_node(self, path, mode, device):
-        dest = self._check_path(path, P_NODE)
+        dest = self.check_path(path, P_NODE)
         if not dest:
             return
 
@@ -652,16 +656,19 @@ class TarFileArchive(FileCacheArchive):
     # this can be used to set permissions if using the
     # tarfile.add() interface to add directory trees.
     def copy_permissions_filter(self, tarinfo):
-        orig_path = tarinfo.name[len(os.path.split(self._name)[-1]):]
+        orig_path = tarinfo.name[len(os.path.split(self._archive_root)[-1]):]
         if not orig_path:
             orig_path = self._archive_root
+        skips = ['/version.txt$', '/sos_logs(/.*)?', '/sos_reports(/.*)?']
+        if any(re.match(skip, orig_path) for skip in skips):
+            return None
         try:
             fstat = os.stat(orig_path)
         except OSError:
             return tarinfo
         if self._with_selinux_context:
             context = self.get_selinux_context(orig_path)
-            if(context):
+            if context:
                 tarinfo.pax_headers['RHT.security.selinux'] = context
         self.set_tarinfo_from_stat(tarinfo, fstat)
         return tarinfo
@@ -674,7 +681,7 @@ class TarFileArchive(FileCacheArchive):
             return None
 
     def name(self):
-        return "%s.%s" % (self._name, self._suffix)
+        return "%s.%s" % (self._archive_root, self._suffix)
 
     def name_max(self):
         # GNU Tar format supports unlimited file name length. Just return
@@ -694,9 +701,18 @@ class TarFileArchive(FileCacheArchive):
             kwargs = {'preset': 3}
         tar = tarfile.open(self._archive_name, mode="w:%s" % _comp_mode,
                            **kwargs)
+        # add commonly reviewed files first, so that they can be more easily
+        # read from memory without needing to extract the whole archive
+        for _content in ['version.txt', 'sos_reports', 'sos_logs']:
+            if not os.path.exists(os.path.join(self._archive_root, _content)):
+                continue
+            tar.add(
+                os.path.join(self._archive_root, _content),
+                arcname=f"{self._name}/{_content}"
+            )
         # we need to pass the absolute path to the archive root but we
         # want the names used in the archive to be relative.
-        tar.add(self._archive_root, arcname=os.path.split(self._name)[1],
+        tar.add(self._archive_root, arcname=self._name,
                 filter=self.copy_permissions_filter)
         tar.close()
         self._suffix += ".%s" % _comp_mode

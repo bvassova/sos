@@ -6,6 +6,7 @@
 #
 # See the LICENSE file in the source distribution for further information.
 
+import os
 
 from sos_tests import StageOneReportTest
 
@@ -29,3 +30,12 @@ class NetworkingPluginTest(StageOneReportTest):
     def test_forbidden_globs_skipped(self):
         self.assertFileGlobNotInArchive('/proc/net/rpc/*/channel')
         self.assertFileGlobNotInArchive('/proc/net/rpc/*/flush')
+
+    def test_netdevs_properly_iterated(self):
+        for dev in os.listdir('/sys/class/net'):
+            # some file(s) in the dir might not be real netdevs, see e.g.
+            # https://lwn.net/Articles/142330/
+            if not dev.startswith('bonding_'):
+                self.assertFileGlobInArchive(
+                    "sos_commands/networking/ethtool_*_%s" % dev
+                )

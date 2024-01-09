@@ -16,6 +16,7 @@ import re
 from pipes import quote
 from sos.collector.exceptions import (ConnectionException,
                                       CommandTimeoutException)
+from sos.utilities import bold
 
 
 class RemoteTransport():
@@ -28,6 +29,7 @@ class RemoteTransport():
     """
 
     name = 'undefined'
+    default_user = None
 
     def __init__(self, address, commons):
         self.address = address
@@ -88,6 +90,54 @@ class RemoteTransport():
         """
         return None
 
+    @classmethod
+    def display_help(cls, section):
+        if cls is RemoteTransport:
+            return cls.display_self_help(section)
+        section.set_title("%s Transport Detailed Help"
+                          % cls.name.title().replace('_', ' '))
+        if cls.__doc__ and cls.__doc__ is not RemoteTransport.__doc__:
+            section.add_text(cls.__doc__)
+        else:
+            section.add_text(
+                'Detailed information not available for this transport'
+            )
+        return None
+
+    @classmethod
+    def display_self_help(cls, section):
+        section.set_title('SoS Remote Transport Help')
+        section.add_text(
+            "\nTransports define how SoS connects to nodes and executes "
+            "commands on them for the purposes of an %s run. Generally, "
+            "this means transports define how commands are wrapped locally "
+            "so that they are executed on the remote node(s) instead."
+            % bold('sos collect')
+        )
+
+        section.add_text(
+            "Transports are generally selected by the cluster profile loaded "
+            "for a given execution, however users may explicitly set one "
+            "using '%s'. Note that not all transports will function for all "
+            "cluster/node types."
+            % bold('--transport=$transport_name')
+        )
+
+        section.add_text(
+            'By default, OpenSSH Control Persist is attempted. Additional '
+            'information for each supported transport is available in the '
+            'following help sections:\n'
+        )
+
+        from sos.collector.sosnode import TRANSPORTS
+        for transport in TRANSPORTS:
+            _sec = bold("collect.transports.%s" % transport)
+            _desc = "The '%s' transport" % transport.lower()
+            section.add_text(
+                "{:>8}{:<45}{:<30}".format(' ', _sec, _desc),
+                newline=False
+            )
+
     def connect(self, password):
         """Perform the connection steps in order to ensure that we are able to
         connect to the node for all future operations. Note that this should
@@ -144,8 +194,16 @@ class RemoteTransport():
         raise NotImplementedError("Transport %s does not define disconnect"
                                   % self.name)
 
+    @property
+    def _need_shell(self):
+        """
+        Transports may override this to control when/if commands executed over
+        the transport needs to utilize a shell on the remote host.
+        """
+        return False
+
     def run_command(self, cmd, timeout=180, need_root=False, env=None,
-                    get_pty=False):
+                    use_shell='auto'):
         """Run a command on the node, returning its output and exit code.
         This should return the exit code of the command being executed, not the
         exit code of whatever mechanism the transport uses to execute that
@@ -155,26 +213,25 @@ class RemoteTransport():
         :type cmd:          ``str``
 
         :param timeout:     The maximum time in seconds to allow the cmd to run
-        :type timeout:      ``int``
-
-        :param get_pty:     Does ``cmd`` require a pty?
-        :type get_pty:      ``bool``
+        :type timeout:      ``int```
 
         :param need_root:   Does ``cmd`` require root privileges?
-        :type neeed_root:   ``bool``
+        :type need_root:   ``bool``
 
         :param env:         Specify env vars to be passed to the ``cmd``
         :type env:          ``dict``
 
-        :param get_pty:     Does ``cmd`` require execution with a pty?
-        :type get_pty:      ``bool``
+        :param use_shell:     Does ``cmd`` require execution within a shell?
+        :type use_shell:      ``bool`` or ``auto`` for transport-determined
 
         :returns:           Output of ``cmd`` and the exit code
         :rtype:             ``dict`` with keys ``output`` and ``status``
         """
         self.log_debug('Running command %s' % cmd)
-        if get_pty:
+        if (use_shell is True or
+                (self._need_shell if use_shell == 'auto' else False)):
             cmd = "/bin/bash -c %s" % quote(cmd)
+            self.log_debug(f"Shell requested, command is now {cmd}")
         # currently we only use/support the use of pexpect for handling the
         # execution of these commands, as opposed to directly invoking
         # subprocess.Popen() in conjunction with tools like sshpass.
@@ -225,7 +282,11 @@ class RemoteTransport():
         if not env:
             env = None
 
-        result = pexpect.spawn(cmd, encoding='utf-8', env=env)
+        try:
+            result = pexpect.spawn(cmd, encoding='utf-8', env=env)
+        except pexpect.exceptions.ExceptionPexpect as err:
+            self.log_debug(err.value)
+            return {'status': 127, 'output': ''}
 
         _expects = [pexpect.EOF, pexpect.TIMEOUT]
         if need_root and self.opts.ssh_user != 'root':
@@ -246,6 +307,11 @@ class RemoteTransport():
             return {'status': result.exitstatus, 'output': out}
         elif index == 1:
             raise CommandTimeoutException(cmd)
+        # if we somehow manage to flow to this point, use this bogus exit code
+        # as a signal to debugging efforts that whatever went sideways did so
+        # as part of the above block
+        self.log_debug(f"Unexpected index {index} from pexpect: {result}")
+        return {'status': 999, 'output': ''}
 
     def _send_pexpect_password(self, index, result):
         """Handle password prompts for sudo and su usage for non-root SSH users
@@ -299,7 +365,20 @@ class RemoteTransport():
         :returns:   True if file was successfully copied from remote, or False
         :rtype:     ``bool``
         """
-        return self._retrieve_file(fname, dest)
+        attempts = 0
+        try:
+            while attempts < 5:
+                attempts += 1
+                ret = self._retrieve_file(fname, dest)
+                if ret:
+                    return True
+                self.log_info("File retrieval attempt %s failed" % attempts)
+            self.log_info("File retrieval failed after 5 attempts")
+            return False
+        except Exception as err:
+            self.log_error("Exception encountered during retrieval attempt %s "
+                           "for %s: %s" % (attempts, fname, err))
+            raise err
 
     def _retrieve_file(self, fname, dest):
         raise NotImplementedError("Transport %s does not support file copying"

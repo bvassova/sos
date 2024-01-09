@@ -16,14 +16,17 @@ import json
 import hashlib
 
 
-class Python(Plugin, DebianPlugin, UbuntuPlugin):
+class Python(Plugin):
+    """Captures information on the installed python runtime(s), as well as
+    python modules installed via pip.
+    """
 
     short_desc = 'Python runtime'
 
     plugin_name = 'python'
     profiles = ('system',)
 
-    packages = ('python', 'python3')
+    packages = ('python',)
 
     python_version = "python -V"
 
@@ -40,7 +43,18 @@ class Python(Plugin, DebianPlugin, UbuntuPlugin):
                 self.add_cmd_output("%s list installed" % pip)
 
 
+class UbuntuPython(Python, DebianPlugin, UbuntuPlugin):
+
+    python_version = "python3 -V"
+    packages = ('python3',)
+
+
 class RedHatPython(Python, RedHatPlugin):
+    """In addition to the base information, on Red Hat family distributions the
+    python plugin also supports the 'hashes' option. If enabled, this plugin
+    will generate a json-formatted listing of all pyfiles within the
+    distribution-standard python package installation locations.
+    """
 
     packages = ('python', 'python36', 'python2', 'python3', 'platform-python')
     option_list = [
@@ -51,51 +65,48 @@ class RedHatPython(Python, RedHatPlugin):
     def setup(self):
         self.add_cmd_output(['python2 -V', 'python3 -V'])
         if isinstance(self.policy, RHELPolicy) and \
-                self.policy.dist_version() > 7:
+                self.policy.dist_version() == 8:
             self.python_version = "/usr/libexec/platform-python -V"
         super(RedHatPython, self).setup()
 
+    def collect(self):
         if self.get_option('hashes'):
-            digests = {
-                'digests': []
-            }
+            with self.collection_file('digests.json') as hfile:
+                hfile.write(json.dumps(self.get_hashes(), indent=4))
 
-            py_paths = [
-                '/usr/lib',
-                '/usr/lib64',
-                '/usr/local/lib',
-                '/usr/local/lib64'
-            ]
+    def get_hashes(self):
+        digests = {
+            'digests': []
+        }
+        py_paths = [
+            '/usr/lib',
+            '/usr/lib64',
+            '/usr/local/lib',
+            '/usr/local/lib64'
+        ]
 
-            for py_path in py_paths:
-                for root, _, files in os.walk(self.path_join(py_path)):
-                    for file_ in files:
-                        filepath = self.path_join(root, file_)
-                        if filepath.endswith('.py'):
-                            try:
-                                with open(filepath, 'rb') as f:
-                                    digest = hashlib.sha256()
-                                    chunk = 1024
-                                    while True:
-                                        data = f.read(chunk)
-                                        if data:
-                                            digest.update(data)
-                                        else:
-                                            break
+        for py_path in py_paths:
+            for root, _, files in os.walk(self.path_join(py_path)):
+                for _file in files:
+                    if not _file.endswith('.py'):
+                        continue
+                    filepath = self.path_join(root, _file)
+                    try:
+                        with open(filepath, 'rb') as f:
+                            digest = hashlib.sha256()
+                            data = f.read(1024)
+                            while data:
+                                digest.update(data)
+                                data = f.read(1024)
 
-                                    digest = digest.hexdigest()
-
-                                    digests['digests'].append({
-                                        'filepath': filepath,
-                                        'sha256': digest
-                                    })
-                            except IOError:
-                                self._log_error(
-                                    "Unable to read python file at %s" %
-                                    filepath
-                                )
-
-            self.add_string_as_file(json.dumps(digests), 'digests.json',
-                                    plug_dir=True)
+                            digest = digest.hexdigest()
+                            digests['digests'].append({
+                                'filepath': filepath,
+                                'sha256': digest
+                            })
+                    except IOError:
+                        self._log_error("Unable to read python file at %s"
+                                        % filepath)
+        return digests
 
 # vim: set et ts=4 sw=4 :

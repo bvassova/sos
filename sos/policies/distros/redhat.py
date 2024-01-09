@@ -19,6 +19,9 @@ from sos.presets.redhat import (RHEL_PRESETS, ATOMIC_PRESETS, RHV, RHEL,
                                 ATOMIC)
 from sos.policies.distros import LinuxPolicy, ENV_HOST_SYSROOT
 from sos.policies.package_managers.rpm import RpmPackageManager
+from sos.policies.package_managers.flatpak import FlatpakPackageManager
+from sos.policies.package_managers import MultiPackageManager
+from sos.utilities import bold
 from sos import _sos as _
 
 try:
@@ -37,12 +40,10 @@ class RedHatPolicy(LinuxPolicy):
     vendor = "Red Hat"
     vendor_urls = [
         ('Distribution Website', 'https://www.redhat.com/'),
-        ('Commercial Support', 'https://www.access.redhat.com/')
+        ('Commercial Support', 'https://access.redhat.com/')
     ]
-    _redhat_release = '/etc/redhat-release'
     _tmp_dir = "/var/tmp"
     _in_container = False
-    _host_sysroot = '/'
     default_scl_prefix = '/opt/rh'
     name_pattern = 'friendly'
     upload_url = None
@@ -54,15 +55,19 @@ class RedHatPolicy(LinuxPolicy):
     def __init__(self, sysroot=None, init=None, probe_runtime=True,
                  remote_exec=None):
         super(RedHatPolicy, self).__init__(sysroot=sysroot, init=init,
-                                           probe_runtime=probe_runtime)
+                                           probe_runtime=probe_runtime,
+                                           remote_exec=remote_exec)
         self.usrmove = False
 
-        self.package_manager = RpmPackageManager(chroot=sysroot,
-                                                 remote_exec=remote_exec)
+        self.package_manager = MultiPackageManager(
+                primary=RpmPackageManager,
+                fallbacks=[FlatpakPackageManager],
+                chroot=self.sysroot,
+                remote_exec=remote_exec)
 
         self.valid_subclasses += [RedHatPlugin]
 
-        self.pkgs = self.package_manager.all_pkgs()
+        self.pkgs = self.package_manager.packages
 
         # If rpm query failed, exit
         if not self.pkgs:
@@ -77,7 +82,8 @@ class RedHatPolicy(LinuxPolicy):
             self.PATH = "/sbin:/bin:/usr/sbin:/usr/bin:/root/bin"
         self.PATH += os.pathsep + "/usr/local/bin"
         self.PATH += os.pathsep + "/usr/local/sbin"
-        self.set_exec_path()
+        if not self.remote_exec:
+            self.set_exec_path()
         self.load_presets()
 
     @classmethod
@@ -91,6 +97,31 @@ class RedHatPolicy(LinuxPolicy):
         available one.
         """
         return False
+
+    @classmethod
+    def display_distro_help(cls, section):
+        if cls is not RedHatPolicy:
+            super(RedHatPolicy, cls).display_distro_help(section)
+            return
+        section.add_text(
+            'This policy is a building block for all other Red Hat family '
+            'distributions. You are likely looking for one of the '
+            'distributions listed below.\n'
+        )
+
+        subs = {
+            'centos': CentOsPolicy,
+            'rhel': RHELPolicy,
+            'redhatcoreos': RedHatCoreOSPolicy,
+            'fedora': FedoraPolicy
+        }
+
+        for subc in subs:
+            subln = bold("policies.%s" % subc)
+            section.add_text(
+                "{:>8}{:<35}{:<30}".format(' ', subln, subs[subc].distro),
+                newline=False
+            )
 
     def check_usrmove(self, pkgs):
         """Test whether the running system implements UsrMove.
@@ -134,28 +165,6 @@ class RedHatPolicy(LinuxPolicy):
         else:
             return files
 
-    def runlevel_by_service(self, name):
-        from subprocess import Popen, PIPE
-        ret = []
-        p = Popen("LC_ALL=C /sbin/chkconfig --list %s" % name,
-                  shell=True,
-                  stdout=PIPE,
-                  stderr=PIPE,
-                  bufsize=-1,
-                  close_fds=True)
-        out, err = p.communicate()
-        if err:
-            return ret
-        for tabs in out.split()[1:]:
-            try:
-                (runlevel, onoff) = tabs.split(":", 1)
-            except IndexError:
-                pass
-            else:
-                if onoff == "on":
-                    ret.append(int(runlevel))
-        return ret
-
     def get_tmp_dir(self, opt_tmp_dir):
         if not opt_tmp_dir:
             return self._tmp_dir
@@ -175,11 +184,37 @@ organization before being passed to any third party.
 No changes will be made to system configuration.
 """
 
-RH_API_HOST = "https://access.redhat.com"
+RH_API_HOST = "https://api.access.redhat.com"
 RH_SFTP_HOST = "sftp://sftp.access.redhat.com"
 
 
 class RHELPolicy(RedHatPolicy):
+    """
+    The RHEL policy is used specifically for Red Hat Enterprise Linux, of
+    any release, and not forks or derivative distributions. For example, this
+    policy will be loaded for any RHEL 8 installation, but will not be loaded
+    for CentOS Stream 8 or Red Hat CoreOS, for which there are separate
+    policies.
+
+    Plugins activated by installed packages will only be activated if those
+    packages are installed via RPM (dnf/yum inclusive). Packages installed by
+    other means are not considered by this policy.
+
+    By default, --upload will be directed to using the SFTP location provided
+    by Red Hat for technical support cases. Users who provide login credentials
+    for their Red Hat Customer Portal account will have their archives uploaded
+    to a user-specific directory.
+
+    If users provide those credentials as well as a case number, --upload will
+    instead attempt to directly upload archives to the referenced case, thus
+    streamlining the process of providing data to technical support engineers.
+
+    If either or both of the credentials or case number are omitted or are
+    incorrect, then a temporary anonymous user will be used for upload to the
+    SFTP server, and users will need to provide that information to their
+    technical support engineer. This information will be printed at the end of
+    the upload process for any sos report execution.
+    """
     distro = RHEL_RELEASE_STR
     vendor = "Red Hat"
     msg = _("""\
@@ -236,11 +271,19 @@ support representative.
         if self.commons['cmdlineopts'].upload_url:
             super(RHELPolicy, self).prompt_for_upload_user()
             return
-        if self.case_id and not self.get_upload_user():
-            self.upload_user = input(_(
-                "Enter your Red Hat Customer Portal username for uploading ["
-                "empty for anonymous SFTP]: ")
-            )
+        if not self.get_upload_user():
+            if self.case_id:
+                self.upload_user = input(_(
+                    "Enter your Red Hat Customer Portal username for "
+                    "uploading [empty for anonymous SFTP]: ")
+                )
+            else:   # no case id provided => failover to SFTP
+                self.upload_url = RH_SFTP_HOST
+                self.ui_log.info("No case id provided, uploading to SFTP")
+                self.upload_user = input(_(
+                    "Enter your Red Hat Customer Portal username for "
+                    "uploading to SFTP [empty for anonymous]: ")
+                )
 
     def get_upload_url(self):
         if self.upload_url:
@@ -250,7 +293,7 @@ support representative.
         elif self.commons['cmdlineopts'].upload_protocol == 'sftp':
             return RH_SFTP_HOST
         else:
-            rh_case_api = "/hydra/rest/cases/%s/attachments"
+            rh_case_api = "/support/v1/cases/%s/attachments"
             return RH_API_HOST + rh_case_api % self.case_id
 
     def _get_upload_headers(self):
@@ -269,10 +312,12 @@ support representative.
         """The RH SFTP server will only automatically connect file uploads to
         cases if the filename _starts_ with the case number
         """
+        fname = self.upload_archive_name.split('/')[-1]
         if self.case_id:
-            return "%s_%s" % (self.case_id,
-                              self.upload_archive_name.split('/')[-1])
-        return self.upload_archive_name
+            fname = "%s_%s" % (self.case_id, fname)
+        if self.upload_directory:
+            fname = os.path.join(self.upload_directory, fname)
+        return fname
 
     def upload_sftp(self):
         """Override the base upload_sftp to allow for setting an on-demand
@@ -287,33 +332,43 @@ support representative.
                             " for obtaining SFTP auth token.")
         _token = None
         _user = None
+        url = RH_API_HOST + '/support/v2/sftp/token'
         # we have a username and password, but we need to reset the password
         # to be the token returned from the auth endpoint
         if self.get_upload_user() and self.get_upload_password():
-            url = RH_API_HOST + '/hydra/rest/v1/sftp/token'
             auth = self.get_upload_https_auth()
-            ret = requests.get(url, auth=auth, timeout=10)
+            ret = requests.post(url, auth=auth, timeout=10)
             if ret.status_code == 200:
                 # credentials are valid
                 _user = self.get_upload_user()
                 _token = json.loads(ret.text)['token']
             else:
-                print("Unable to retrieve Red Hat auth token using provided "
-                      "credentials. Will try anonymous.")
+                self.ui_log.debug(
+                    f"DEBUG: auth attempt failed (status: {ret.status_code}): "
+                    f"{ret.json()}"
+                )
+                self.ui_log.error(
+                    "Unable to retrieve Red Hat auth token using provided "
+                    "credentials. Will try anonymous."
+                )
         # we either do not have a username or password/token, or both
         if not _token:
-            aurl = RH_API_HOST + '/hydra/rest/v1/sftp/token?isAnonymous=true'
-            anon = requests.get(aurl, timeout=10)
+            adata = {"isAnonymous": True}
+            anon = requests.post(url, data=json.dumps(adata), timeout=10)
             if anon.status_code == 200:
                 resp = json.loads(anon.text)
                 _user = resp['username']
                 _token = resp['token']
-                print(
-                    "User '%s'"  # lgtm [py/clear-text-logging-sensitive-data]
-                    "used for anonymous upload. Please inform your support "
-                    "engineer so they may retrieve the data."
-                    % _user
+                self.ui_log.info(
+                    _(f"User {_user} used for anonymous upload. Please inform "
+                      f"your support engineer so they may retrieve the data.")
                 )
+            else:
+                self.ui_log.debug(
+                    f"DEBUG: anonymous request failed (status: "
+                    f"{anon.status_code}): {anon.json()}"
+                )
+
         if _user and _token:
             return super(RHELPolicy, self).upload_sftp(user=_user,
                                                        password=_token)
@@ -324,7 +379,8 @@ support representative.
         from RHCP failures to the public RH dropbox
         """
         try:
-            if not self.get_upload_user() or not self.get_upload_password():
+            if self.upload_url and self.upload_url.startswith(RH_API_HOST) and\
+              (not self.get_upload_user() or not self.get_upload_password()):
                 self.upload_url = RH_SFTP_HOST
             uploaded = super(RHELPolicy, self).upload_archive(archive)
         except Exception:
@@ -332,8 +388,10 @@ support representative.
             if not self.upload_url.startswith(RH_API_HOST):
                 raise
             else:
-                print("Upload to Red Hat Customer Portal failed. Trying %s"
-                      % RH_SFTP_HOST)
+                self.ui_log.error(
+                    _(f"Upload to Red Hat Customer Portal failed. Trying "
+                      f"{RH_SFTP_HOST}")
+                )
                 self.upload_url = RH_SFTP_HOST
                 uploaded = super(RHELPolicy, self).upload_archive(archive)
         return uploaded
@@ -342,16 +400,10 @@ support representative.
         try:
             rr = self.package_manager.all_pkgs_by_name_regex("redhat-release*")
             pkgname = self.pkgs[rr[0]]["version"]
-            if pkgname[0] == "4":
-                return 4
-            elif pkgname[0] in ["5Server", "5Client"]:
-                return 5
-            elif pkgname[0] == "6":
-                return 6
-            elif pkgname[0] == "7":
-                return 7
-            elif pkgname[0] == "8":
-                return 8
+            # this should always map to the major version number. This will not
+            # be so on RHEL 5, but RHEL 5 does not support python3 and thus
+            # should never run a version of sos with this check
+            return int(pkgname[0])
         except Exception:
             pass
         return False
@@ -359,7 +411,7 @@ support representative.
     def probe_preset(self):
         # Emergency or rescue mode?
         for target in ["rescue", "emergency"]:
-            if self.init_system.is_running("%s.target" % target):
+            if self.init_system.is_running("%s.target" % target, False):
                 return self.find_preset(CB)
         # Package based checks
         if self.pkg_by_name("satellite-common") is not None:
@@ -415,12 +467,13 @@ support representative.
         atomic = False
         if ENV_HOST_SYSROOT not in os.environ:
             return atomic
-        host_release = os.environ[ENV_HOST_SYSROOT] + cls._redhat_release
+        host_release = os.environ[ENV_HOST_SYSROOT] + OS_RELEASE
         if not os.path.exists(host_release):
             return False
         try:
-            for line in open(host_release, "r").read().splitlines():
-                atomic |= ATOMIC_RELEASE_STR in line
+            with open(host_release, 'r') as afile:
+                for line in afile.read().splitlines():
+                    atomic |= ATOMIC_RELEASE_STR in line
         except IOError:
             pass
         return atomic
@@ -450,6 +503,26 @@ support representative.
 
 
 class RedHatCoreOSPolicy(RHELPolicy):
+    """
+    Red Hat CoreOS is a containerized host built upon Red Hat Enterprise Linux
+    and as such this policy is built on top of the RHEL policy. For users, this
+    should be entirely transparent as any behavior exhibited or influenced on
+    RHEL systems by that policy will be seen on RHCOS systems as well.
+
+    The one change is that this policy ensures that sos collect will deploy a
+    container on RHCOS systems in order to facilitate sos report collection,
+    as RHCOS discourages non-default package installation via rpm-ostree which
+    is used to maintain atomicity for RHCOS nodes. The default container image
+    used by this policy is the support-tools image maintained by Red Hat on
+    registry.redhat.io.
+
+    Note that this policy is only loaded when sos is directly run on an RHCOS
+    node - if sos collect uses the `oc` transport (the default transport that
+    will be attempted by the ocp cluster profile), then the policy loaded
+    inside the launched pod will be RHEL. Again, this is expected and will not
+    impact how sos report collections are performed.
+    """
+
     distro = "Red Hat CoreOS"
     msg = _("""\
 This command will collect diagnostic and configuration \
@@ -482,10 +555,11 @@ support representative.
         coreos = False
         if ENV_HOST_SYSROOT not in os.environ:
             return coreos
-        host_release = os.environ[ENV_HOST_SYSROOT] + cls._redhat_release
+        host_release = os.environ[ENV_HOST_SYSROOT] + OS_RELEASE
         try:
-            for line in open(host_release, 'r').read().splitlines():
-                coreos |= 'Red Hat Enterprise Linux CoreOS' in line
+            with open(host_release, 'r') as hfile:
+                for line in hfile.read().splitlines():
+                    coreos |= 'Red Hat Enterprise Linux CoreOS' in line
         except IOError:
             pass
         return coreos
@@ -520,6 +594,18 @@ class CentOsAtomicPolicy(RedHatAtomicPolicy):
 
 
 class FedoraPolicy(RedHatPolicy):
+    """
+    The policy for Fedora based systems, regardless of spin/edition. This
+    policy is based on the parent Red Hat policy, and thus will only check for
+    RPM packages when considering packaged-based plugin enablement. Packages
+    installed by other sources are not considered.
+
+    There is no default --upload location for this policy. If users need to
+    upload an sos report archive from a Fedora system, they will need to
+    provide the location via --upload-url, and optionally login credentials
+    for that location via --upload-user and --upload-pass (or the appropriate
+    environment variables).
+    """
 
     distro = "Fedora"
     vendor = "the Fedora Project"

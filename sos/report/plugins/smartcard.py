@@ -19,14 +19,18 @@ class Smartcard(Plugin, RedHatPlugin):
     profiles = ('security', 'identity', 'hardware')
 
     files = ('/etc/pam_pkcs11/pam_pkcs11.conf',)
-    packages = ('pam_pkcs11', 'pcsc-tools', 'opensc')
+    # The pam_pkcs11 is available only in RHEL7
+    packages = ('pam_pkcs11', 'pcsc-tools', 'opensc', 'pcsc-lite',
+                'pcsc-lite-ccid')
 
     def setup(self):
         self.add_copy_spec([
             "/etc/reader.conf",
             "/etc/reader.conf.d/",
             "/etc/pam_pkcs11/",
-            "/etc/opensc-*.conf"
+            "/etc/opensc-*.conf",
+            "/etc/pkcs11/modules/*.module",
+            "/usr/share/p11-kit/modules/*.module"
         ])
         self.add_cmd_output([
             "pklogin_finder debug",

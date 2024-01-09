@@ -37,6 +37,11 @@ class OpenStackCeilometer(Plugin):
             self.var_puppet_gen + "/etc/ceilometer/*"
         ])
 
+        self.add_file_tags({
+            "/var/log/ceilometer/central.log":
+                "ceilometer_central_log"
+        })
+
     def apply_regex_sub(self, regexp, subst):
         self.do_path_regex_sub("/etc/ceilometer/*", regexp, subst)
         self.do_path_regex_sub(
@@ -54,11 +59,11 @@ class OpenStackCeilometer(Plugin):
         connection_keys = ["connection", "backend_url", "transport_url"]
 
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
+            r"(^\s*(%s)\s*=\s*)(.*)" % "|".join(protect_keys),
             r"\1*********"
         )
         self.apply_regex_sub(
-            r"((?m)^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
+            r"(^\s*(%s)\s*=\s*(.*)://(\w*):)(.*)(@(.*))" %
             "|".join(connection_keys),
             r"\1*********\6"
         )
@@ -71,10 +76,11 @@ class DebianCeilometer(OpenStackCeilometer, DebianPlugin,
         'ceilometer-api',
         'ceilometer-agent-central',
         'ceilometer-agent-compute',
+        'ceilometer-agent-notification',
         'ceilometer-collector',
         'ceilometer-common',
         'python-ceilometer',
-        'python-ceilometerclient'
+        'python3-ceilometer',
     )
 
 
@@ -86,11 +92,11 @@ class RedHatCeilometer(OpenStackCeilometer, RedHatPlugin):
         super(RedHatCeilometer, self).setup()
         if self.get_option("all_logs"):
             self.add_copy_spec([
-                "/var/log/httpd/ceilometer*",
+                "/var/log/containers/ceilometer/*",
             ])
         else:
             self.add_copy_spec([
-                "/var/log/httpd/ceilometer*.log",
+                "/var/log/containers/ceilometer/*.log",
             ])
 
 # vim: set et ts=4 sw=4 :

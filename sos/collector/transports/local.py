@@ -15,9 +15,10 @@ from sos.collector.transports import RemoteTransport
 
 
 class LocalTransport(RemoteTransport):
-    """A 'transport' to represent a local node. This allows us to more easily
-    extend SoSNode() without having a ton of 'if local' or similar checks in
-    more places than we actually need them
+    """
+    A 'transport' to represent a local node. No remote connection is actually
+    made, and all commands set to be run by this transport are executed locally
+    without any wrappers.
     """
 
     name = 'local_node'
@@ -35,6 +36,7 @@ class LocalTransport(RemoteTransport):
     def _retrieve_file(self, fname, dest):
         self.log_debug("Moving %s to %s" % (fname, dest))
         shutil.copy(fname, dest)
+        return True
 
     def _format_cmd_for_exec(self, cmd):
         return cmd

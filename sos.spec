@@ -1,22 +1,27 @@
-%{!?python_sitelib: %define python_sitelib %(%{__python} -c "from distutils.sysconfig import get_python_lib; print get_python_lib()")}
-
 Summary: A set of tools to gather troubleshooting information from a system
 Name: sos
-Version: 4.2
+Version: 4.6.0
 Release: 1%{?dist}
-Group: Applications/System
 Source0: https://github.com/sosreport/sos/archive/%{name}-%{version}.tar.gz
-License: GPLv2+
-BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-buildroot
+License: GPL-2.0-or-later
 BuildArch: noarch
-Url: https://github.com/sosreport/sos/
+Url: https://github.com/sosreport/sos
 BuildRequires: python3-devel
-BuildRequires: gettext
+BuildRequires: python3-setuptools
 Requires: python3-rpm
-Requires: tar
-Requires: xz
 Requires: python3-pexpect
+%if 0%{?rhel} && 0%{?rhel} < 10
+Requires: python3-setuptools
+%else
+Requires: python3-packaging
+%endif
+Recommends: python3-magic
+# Mandatory just for uploading to a SFTP server:
+Recommends: python3-requests
+Recommends: python3-pyyaml
 Obsoletes: sos-collector <= 1.9
+# For the _tmpfilesdir macro.
+BuildRequires: systemd
 
 %description
 Sos is a set of tools that gathers information about system
@@ -27,31 +32,56 @@ support technicians and developers.
 %prep
 %setup -qn %{name}-%{version}
 
+%if 0%{?fedora} >= 39
+%generate_buildrequires
+%pyproject_buildrequires
+%endif
+
 %build
+%if 0%{?fedora} >= 39
+%pyproject_wheel
+%else
 %py3_build
+%endif
 
 %install
+%if 0%{?fedora} >= 39
+%pyproject_install
+%pyproject_save_files sos
+%else
 %py3_install '--install-scripts=%{_sbindir}'
+%endif
 
-install -d -m 755 ${RPM_BUILD_ROOT}/etc/sos
-install -d -m 700 ${RPM_BUILD_ROOT}/etc/sos/cleaner
-install -d -m 755 ${RPM_BUILD_ROOT}/etc/sos/presets.d
-install -d -m 755 ${RPM_BUILD_ROOT}/etc/sos/groups.d
-install -d -m 755 ${RPM_BUILD_ROOT}/etc/sos/extras.d
-install -m 644 %{name}.conf ${RPM_BUILD_ROOT}/etc/sos/%{name}.conf
+install -d -m 755 %{buildroot}%{_sysconfdir}/%{name}
+install -d -m 700 %{buildroot}%{_sysconfdir}/%{name}/cleaner
+install -d -m 755 %{buildroot}%{_sysconfdir}/%{name}/presets.d
+install -d -m 755 %{buildroot}%{_sysconfdir}/%{name}/groups.d
+install -d -m 755 %{buildroot}%{_sysconfdir}/%{name}/extras.d
+install -d -m 755 %{buildroot}%{_tmpfilesdir}
+install -m 644 %{name}.conf %{buildroot}%{_sysconfdir}/%{name}/%{name}.conf
+install -m 644 tmpfiles/tmpfilesd-sos-rh.conf %{buildroot}%{_tmpfilesdir}/%{name}.conf
 
-rm -rf ${RPM_BUILD_ROOT}/usr/config/
+rm -rf %{buildroot}/usr/config/
 
 %find_lang %{name} || echo 0
 
-%files -f %{name}.lang
+# internationalization is currently broken. Uncomment this line once fixed.
+# %%files -f %%{name}.lang
+%files
+%if 0%{?fedora} >= 39
+%{_bindir}/sos
+%{_bindir}/sosreport
+%{_bindir}/sos-collector
+%else
 %{_sbindir}/sos
 %{_sbindir}/sosreport
 %{_sbindir}/sos-collector
+%endif
 %dir /etc/sos/cleaner
 %dir /etc/sos/presets.d
 %dir /etc/sos/extras.d
 %dir /etc/sos/groups.d
+%{_tmpfilesdir}/%{name}.conf
 %{python3_sitelib}/*
 %{_mandir}/man1/*
 %{_mandir}/man5/*
@@ -60,6 +90,37 @@ rm -rf ${RPM_BUILD_ROOT}/usr/config/
 %config(noreplace) %{_sysconfdir}/sos/sos.conf
 
 %changelog
+* Thu Aug 17 2023 Jake Hunsaker <jacob.r.hunsaker@gmail.com> = 4.6.0
+- New upstream release
+
+* Thu Jul 20 2023 Jake Hunsaker <jacob.r.hunsaker@gmail.com> = 4.5.6
+- New upstream release
+
+* Fri Jun 23 2023 Jake Hunsaker <jacob.r.hunsaker@gmail.com> = 4.5.5
+- New upstream release
+
+* Fri May 26 2023 Jake Hunsaker <jhunsake@redhat.com> = 4.5.4
+- New upstream release
+
+* Fri Apr 28 2023 Jake Hunsaker <jhunsake@redhat.com> = 4.5.3
+- New upstream release
+
+* Fri Mar 31 2023 Jake Hunsaker <jhunsake@redhat.com> = 4.5.2
+- New upstream release
+- Migrated to SPDX license
+
+* Wed Mar 01 2023 Jake Hunsaker <jhunsake@redhat.com> = 4.5.1
+- New upstream release
+
+* Wed Feb 01 2023 Jake Hunsaker <jhunsake@redhat.com> = 4.5.0
+- New upstream release
+
+* Mon Aug 15 2022 Jake Hunsaker <jhunsake@redhat.com> = 4.4
+- New upstream release
+
+* Mon Feb 14 2022 Jake Hunsaker <jhunsake@redhat.com> = 4.3
+- New upstream release
+
 * Mon Aug 16 2021 Jake Hunsaker <jhunsake@redhat.com> = 4.2
 - New upstream release
 

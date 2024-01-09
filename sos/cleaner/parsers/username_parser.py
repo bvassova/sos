@@ -8,7 +8,6 @@
 #
 # See the LICENSE file in the source distribution for further information.
 
-
 from sos.cleaner.parsers import SoSCleanerParser
 from sos.cleaner.mappings.username_map import SoSUsernameMap
 
@@ -26,42 +25,10 @@ class SoSUsernameParser(SoSCleanerParser):
     name = 'Username Parser'
     map_file_key = 'username_map'
     regex_patterns = []
-    skip_list = [
-        'core',
-        'nobody',
-        'nfsnobody',
-        'shutdown',
-        'reboot',
-        'root',
-        'ubuntu',
-        'wtmp'
-    ]
 
-    def __init__(self, config, opt_names=None):
+    def __init__(self, config):
         self.mapping = SoSUsernameMap()
         super(SoSUsernameParser, self).__init__(config)
-        self.mapping.load_names_from_options(opt_names)
 
-    def load_usernames_into_map(self, content):
-        """Since we don't get the list of usernames from a straight regex for
-        this parser, we need to override the initial parser prepping here.
-        """
-        users = set()
-        for line in content.splitlines()[1:]:
-            try:
-                user = line.split()[0]
-            except Exception:
-                continue
-            if user in self.skip_list:
-                continue
-            users.add(user)
-        for each in users:
-            self.mapping.get(each)
-
-    def parse_line(self, line):
-        count = 0
-        for username in sorted(self.mapping.dataset.keys(), reverse=True):
-            if username in line:
-                count = line.count(username)
-                line = line.replace(username, self.mapping.get(username))
-        return line, count
+    def _parse_line(self, line):
+        return line, 0

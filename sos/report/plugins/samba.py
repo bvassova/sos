@@ -33,12 +33,13 @@ class Samba(Plugin, RedHatPlugin, DebianPlugin, UbuntuPlugin):
         if self.get_option("all_logs"):
             self.add_copy_spec("/var/log/samba/")
 
+        self.add_cmd_output("testparm -s", tags="testparm_s")
         self.add_cmd_output([
-            "testparm -s",
             "wbinfo --domain='.' --domain-users",
             "wbinfo --domain='.' --domain-groups",
             "wbinfo --trusted-domains --verbose",
             "net primarytrust dumpinfo",
+            "net ads info",
         ])
 
 

@@ -13,10 +13,10 @@ from sos.report.plugins import (
     RedHatPlugin,
     DebianPlugin,
     UbuntuPlugin,
-    SoSPredicate,
 )
 import json
 import os
+import re
 
 
 class OVNCentral(Plugin):
@@ -24,7 +24,24 @@ class OVNCentral(Plugin):
     short_desc = 'OVN Northd'
     plugin_name = "ovn_central"
     profiles = ('network', 'virt')
-    containers = ('ovs-db-bundle.*',)
+    containers = ('ovn-dbs-bundle.*', 'ovn_cluster_north_db_server')
+
+    def _find_sock(self, path, regex_name):
+        _sfile = os.path.join(path, regex_name)
+        if self._container_name:
+            res = self.exec_cmd("ls %s" % path, container=self._container_name)
+            if res['status'] != 0 or '\n' not in res['output']:
+                self._log_error(
+                    "Could not retrieve ovn_controller socket path "
+                    "from container %s" % self._container_name
+                )
+            else:
+                pattern = re.compile(regex_name)
+                for filename in res['output'].split('\n'):
+                    if pattern.match(filename):
+                        return os.path.join(path, filename)
+        # File not found, return the regex full path
+        return _sfile
 
     def get_tables_from_schema(self, filename, skip=[]):
         if self._container_name:
@@ -34,12 +51,12 @@ class OVNCentral(Plugin):
             if res['status'] != 0:
                 self._log_error("Could not retrieve DB schema file from "
                                 "container %s" % self._container_name)
-                return
+                return None
             try:
                 db = json.loads(res['output'])
             except Exception:
                 self._log_error("Cannot parse JSON file %s" % filename)
-                return
+                return None
         else:
             try:
                 with open(self.path_join(filename), 'r') as f:
@@ -48,16 +65,17 @@ class OVNCentral(Plugin):
                     except Exception:
                         self._log_error(
                             "Cannot parse JSON file %s" % filename)
-                        return
+                        return None
             except IOError as ex:
                 self._log_error(
                     "Could not open DB schema file %s: %s" % (filename, ex))
-                return
+                return None
         try:
             return [table for table in dict.keys(
                 db['tables']) if table not in skip]
         except AttributeError:
             self._log_error("DB schema %s has no 'tables' key" % filename)
+        return None
 
     def add_database_output(self, tables, cmds, ovn_cmd):
         if not tables:
@@ -66,7 +84,13 @@ class OVNCentral(Plugin):
             cmds.append('%s list %s' % (ovn_cmd, table))
 
     def setup(self):
-        self._container_name = self.get_container_by_name('ovs-dbs-bundle.*')
+        # check if env is a clustered or non-clustered one
+        if self.container_exists(self.containers[1]):
+            self._container_name = self.get_container_by_name(
+                self.containers[1])
+        else:
+            self._container_name = self.get_container_by_name(
+                self.containers[0])
 
         ovs_rundir = os.environ.get('OVS_RUNDIR')
         for pidfile in ['ovnnb_db.pid', 'ovnsb_db.pid', 'ovn-northd.pid']:
@@ -84,62 +108,83 @@ class OVNCentral(Plugin):
         else:
             self.add_copy_spec("/var/log/ovn/*.log")
 
+        ovn_controller_sock_path = self._find_sock(
+            self.ovn_sock_path, self.ovn_controller_sock_regex)
+
+        northd_sock_path = self._find_sock(self.ovn_sock_path,
+                                           self.ovn_northd_sock_regex)
+
+        # ovsdb nb/sb cluster status commands
+        self.add_cmd_output(
+            [
+                'ovs-appctl -t {} cluster/status OVN_Northbound'.format(
+                    self.ovn_nbdb_sock_path),
+                'ovs-appctl -t {} cluster/status OVN_Southbound'.format(
+                    self.ovn_sbdb_sock_path),
+                'ovn-appctl -t {} status'.format(northd_sock_path),
+                'ovn-appctl -t {} debug/chassis-features-list'.format(
+                    northd_sock_path),
+                'ovn-appctl -t {} connection-status'.format(
+                    ovn_controller_sock_path),
+            ],
+            foreground=True, container=self._container_name, timeout=30
+        )
+
         # Some user-friendly versions of DB output
         nbctl_cmds = [
-            'ovn-nbctl show',
-            'ovn-nbctl get-ssl',
-            'ovn-nbctl get-connection',
-            'ovn-nbctl list loadbalancer',
-            'ovn-nbctl list Load_Balancer',
-            'ovn-nbctl list ACL',
-            'ovn-nbctl list Logical_Switch_Port',
+            'ovn-nbctl --no-leader-only show',
+            'ovn-nbctl --no-leader-only get-ssl',
+            'ovn-nbctl --no-leader-only get-connection',
         ]
 
         sbctl_cmds = [
-            'ovn-sbctl show',
-            'ovn-sbctl lflow-list',
-            'ovn-sbctl get-ssl',
-            'ovn-sbctl get-connection',
+            'ovn-sbctl --no-leader-only show',
+            'ovn-sbctl --no-leader-only lflow-list',
+            'ovn-sbctl --no-leader-only get-ssl',
+            'ovn-sbctl --no-leader-only get-connection',
         ]
 
-        schema_dir = '/usr/share/openvswitch'
-
-        nb_tables = self.get_tables_from_schema(self.path_join(
-            schema_dir, 'ovn-nb.ovsschema'))
-
-        self.add_database_output(nb_tables, nbctl_cmds, 'ovn-nbctl')
+        # backward compatibility
+        for path in ['/usr/share/openvswitch', '/usr/share/ovn']:
+            nb_tables = self.get_tables_from_schema(self.path_join(
+                path, 'ovn-nb.ovsschema'))
+            self.add_database_output(nb_tables, nbctl_cmds,
+                                     'ovn-nbctl --no-leader-only')
 
         cmds = nbctl_cmds
 
-        # Can only run sbdb commands if we are the leader
-        co = {'cmd': "ovs-appctl -t {} cluster/status OVN_Southbound".
-              format(self.ovn_sbdb_sock_path),
-              "output": "Leader: self"}
-        if self.test_predicate(self, pred=SoSPredicate(self, cmd_outputs=co)):
+        for path in ['/usr/share/openvswitch', '/usr/share/ovn']:
             sb_tables = self.get_tables_from_schema(self.path_join(
-                schema_dir, 'ovn-sb.ovsschema'), ['Logical_Flow'])
-            self.add_database_output(sb_tables, sbctl_cmds, 'ovn-sbctl')
-            cmds += sbctl_cmds
+                path, 'ovn-sb.ovsschema'), ['Logical_Flow'])
+            self.add_database_output(sb_tables, sbctl_cmds,
+                                     'ovn-sbctl --no-leader-only')
+        cmds += sbctl_cmds
 
         # If OVN is containerized, we need to run the above commands inside
-        # the container.
-        cmds = [
-            self.fmt_container_cmd(self._container_name, cmd) for cmd in cmds
-        ]
-
-        self.add_cmd_output(cmds, foreground=True)
+        # the container. Removing duplicates (in case there are) to avoid
+        # failing on collecting output to file on container running commands
+        cmds = list(set(cmds))
+        self.add_cmd_output(
+            cmds, foreground=True, container=self._container_name
+        )
 
         self.add_copy_spec("/etc/sysconfig/ovn-northd")
 
         ovs_dbdir = os.environ.get('OVS_DBDIR')
-        for dbfile in ['ovnnb_db.db', 'ovnsb_db.db']:
-            self.add_copy_spec([
-                self.path_join('/var/lib/openvswitch/ovn', dbfile),
-                self.path_join('/usr/local/etc/openvswitch', dbfile),
-                self.path_join('/etc/openvswitch', dbfile),
-                self.path_join('/var/lib/openvswitch', dbfile),
-                self.path_join('/var/lib/ovn/etc', dbfile)
-            ])
+        for dbfile in ["ovnnb_db.db", "ovnsb_db.db"]:
+            for path in [
+                "/var/lib/openvswitch/ovn",
+                "/usr/local/etc/openvswitch",
+                "/etc/openvswitch",
+                "/var/lib/openvswitch",
+                "/var/lib/ovn/etc",
+                "/var/lib/ovn",
+            ]:
+                dbfilepath = self.path_join(path, dbfile)
+                if os.path.exists(dbfilepath):
+                    self.add_copy_spec(dbfilepath)
+                    self.add_cmd_output(
+                        "ls -lan %s" % dbfilepath, foreground=True)
             if ovs_dbdir:
                 self.add_copy_spec(self.path_join(ovs_dbdir, dbfile))
 
@@ -148,11 +193,19 @@ class OVNCentral(Plugin):
 
 class RedHatOVNCentral(OVNCentral, RedHatPlugin):
 
-    packages = ('openvswitch-ovn-central', 'ovn2.*-central', )
+    packages = ('openvswitch-ovn-central', 'ovn.*-central', )
+    ovn_nbdb_sock_path = '/var/run/openvswitch/ovnnb_db.ctl'
     ovn_sbdb_sock_path = '/var/run/openvswitch/ovnsb_db.ctl'
+    ovn_sock_path = '/var/run/openvswitch'
+    ovn_controller_sock_regex = 'ovn-controller.*.ctl'
+    ovn_northd_sock_regex = 'ovn-northd.*.ctl'
 
 
 class DebianOVNCentral(OVNCentral, DebianPlugin, UbuntuPlugin):
 
     packages = ('ovn-central', )
+    ovn_nbdb_sock_path = '/var/run/ovn/ovnnb_db.ctl'
     ovn_sbdb_sock_path = '/var/run/ovn/ovnsb_db.ctl'
+    ovn_sock_path = '/var/run/ovn'
+    ovn_controller_sock_regex = 'ovn-controller.*.ctl'
+    ovn_northd_sock_regex = 'ovn-northd.*.ctl'
